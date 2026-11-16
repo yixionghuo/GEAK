@@ -84,6 +84,9 @@ OPTIONAL profile-analysis prior (empty string = not provided): `ANALYSIS_SKILL`,
 OPTIONAL upstream TraceLens prior (may be empty strings — treat empty/missing as "not provided"):
 `TRACELENS_KERNEL_CANDIDATES_JSON`, `TRACELENS_REPORT_JSON`, `TRACELENS_ANALYSIS_MD`,
 `TRACELENS_TRACE_FILE`.
+OPTIONAL fusion profile (only when KernelFusion is switched on and found regions): `FUSION_STRATEGY`,
+`FUSION_CANDIDATES`, `FUSION_RECOMMENDED`, `FUSION_TOPK_JSON`, `FUSION_REPORT`, `IMPLEMENTABLE_LEVELS`,
+`UNSUPPORTED_PATTERNS` — see step 1e.
 
 0. Read `EVAL_DIR/env_report.json`. Let `model_arch_class` set expectations (e.g. MoE → expect
    grouped/fused-MoE GEMM in the Top-N; hybrid-mamba → expect linear-attn Triton kernels; MLA → expect
@@ -195,6 +198,9 @@ OPTIONAL upstream TraceLens prior (may be empty strings — treat empty/missing 
    fixed**. The user-supplied workload — `isl`, `osl`, **`conc`/batch size — must NOT be changed**, and
    **speculative decoding (MTP or otherwise) must NOT be introduced** as an optimization. Raising
    throughput by changing what is being measured is out of scope for this workflow.
+1e. **Fusion regions (only if `FUSION_STRATEGY` is in your inputs; otherwise skip this step entirely and
+   route exactly as before).** Read `FUSION_STRATEGY` and follow it: it adds the fusion profile's regions
+   to the kernel track as `kernel_candidates` that name a `fusion_id`.
 
 2. Partition the Top-N into FOUR routes (by what optimization the op admits, NOT by edit flag):
    - **config fast path** — service-level env/flag with no op isolation: `--attention-backend` swap,
@@ -352,6 +358,8 @@ change), `HISTORY`, `SKILL_DIR`.
    already showed no e2e gain THIS run, prefer a different kernel or a different mechanism) — NEVER as a
    permanent blocklist.** A past null may just mean it wasn't optimized well; if it's still the best
    remaining lever, nominate it with a fresh angle.
+6. **Fusion regions (only if `FUSION_STRATEGY` is in your inputs).** Nominate the fusion profile's regions
+   as `FUSION_STRATEGY` says, under rules 2-5 like any kernel.
 
 Return JSON:
 ```json
@@ -444,8 +452,8 @@ Return JSON:
 
 Inputs: `EVAL_DIR`, full `HISTORY`, `BASELINE_THROUGHPUT`, `FINAL_THROUGHPUT`, accepted config +
 kernel changes, `MILESTONES`, `BUDGET_USED`, `BUDGET`, `MIN_KERNEL_TASKS`, `PROFILE_TOPN`, `WORKLOAD`,
-`MODEL_NAME`, `KB_RECALL` (see §2c), `SKILL_DIR`, and — when the standalone tuning phase ran —
-`TUNING_RESULT` (see §2b).
+`MODEL_NAME`, `KB_RECALL` (see §2c), `SKILL_DIR`, — when the standalone tuning phase ran —
+`TUNING_RESULT` (see §2b), and — when KernelFusion is switched on — `KERNEL_FUSION` (see §2d).
 
 Write TWO files:
 
@@ -633,6 +641,24 @@ attempt, win or not. REQUIRED sections, in order:
      section 7, and never present an inherited gain as this run's optimization.
    - A recalled record that lost here is a **lead, not a dead end** — say so, and give the reader the path
      to its bundle so they can read what it actually did.
+
+2d. **🔗 KernelFusion** — MANDATORY whenever `KERNEL_FUSION` is present (omit it entirely otherwise; the
+   switch was off). It is the run's KernelFusion record: the fusion profile (`status`, `reason`,
+   `topk_json`, `report_path`, `candidates`, `recommended`, `single_kernel_route`), the regions routed or
+   prepared (`routed`, `unprepared`), the regions banked (`accepted`) and each region's A/B (`outcomes`).
+   Write, in this order:
+   - **One-line verdict**: how many regions the profile recommended, how many got a region UT, how many
+     reached an A/B, how many landed, and their summed e2e delta. When the profile did not run or failed,
+     say why (`status` / `reason`) and stop the section there.
+   - **Regions table**: `id | level | region | route | est. gain % (fusion / single kernel) | UT? | A/B e2e % | verdict`.
+     One row per recommended region and per region in `single_kernel_route`; a region that never reached an
+     A/B says where it stopped (`unprepared` reason, time, budget).
+   - **Single-kernel route**: the regions the analysis judged worth more as single-kernel work, with the
+     analysis's one-line reason from `report_path`.
+   - **Where each landed region sits**: HeadKernel slot (`<head short_name>:kf_<id>` in HISTORY) or the
+     Milestone loop, and the delivered variant (stock / tuned member / tuned and fused) from the lane's notes.
+   Do not add a region's delta to the head or Milestone deltas in §3: it is one of them, listed again here.
+   Source: `KERNEL_FUSION`, `EVAL_DIR/kernel_fusion/analysis/REPORT.md`, HISTORY. Never invent.
 
 3. **Head-kernel deep-dive** (the centerpiece) — for EACH head op a `####` sub-section titled
    `<id> — <op> (<pct>% GPU) — RESULT: <ACCEPTED +X% | no win | flagged>`, containing:
