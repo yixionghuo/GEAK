@@ -248,6 +248,7 @@ The workflow writes the following fields to the result file.
     "candidates": [ /* the fusion profile's regions */ ],
     "recommended": ["c2", "c1"],
     "single_kernel_route": ["c5"],       // regions the analysis left to single-kernel work (never routed)
+    "handbacks": [{"short_name": "kf_c2", "handback": ".../kernel_fusion/handback/kf_c2", "ok": true, "warnings": []}],
     "routed": ["kf_c2"],                 // regions the architect sent to the kernel track
     "unprepared": [ /* AgentX: recommended regions without a passing region UT, with the reason */ ],
     "accepted": [{"short_name": "kf_c2", "fusion_id": "c2", "isolated_speedup": 1.3, "e2e_delta_pct": 1.8}],

@@ -161,7 +161,11 @@ const backend = {
       const target = (/at "([^"]+)"/.exec(prompt) || [])[1] || '';
       return { text: JSON.stringify({ written: true, path: target, checkpoint_sha256: 'a'.repeat(64) }) };
     }
-    const a = answers[label];
+    // Every region's hand-back check passes, but kf_c2's in on_bad_handback.
+    const hb = String(label).startsWith('handback ') ? () => ((scenario === 'on_bad_handback' && label === 'handback kf_c2')
+      ? { ok: false, problems: ['support.json is missing or not a JSON object'], warnings: [] }
+      : { ok: true, problems: [], warnings: [], handback: `${EV}/kernel_fusion/handback/${label.slice(9)}`, speedup: 1.3 }) : null;
+    const a = answers[label] || hb;
     return { text: JSON.stringify(a ? a(prompt) : null) };
   },
 };

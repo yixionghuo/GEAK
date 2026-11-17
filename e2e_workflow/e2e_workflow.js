@@ -3619,6 +3619,8 @@ const kfList = (v) => (Array.isArray(v) ? v.map(String) : []);
 const kfSeamOf = (c) => (c && c.seam && c.seam.target_callable) || '';
 const kfShortOf = (c) => `kf_${String(c.id).replace(/[^A-Za-z0-9_]+/g, '_')}`;
 const kfIntro = (s) => s + (KF_TASK ? ` OPERATOR CONSTRAINTS (they bind you): ${KF_TASK}` : '');
+// A region's entry of the fusion analysis, written into its UT as analysis.json (fusion_ut_contract.md).
+const kfAnalysisOf = (c) => ({ ...kfPick(c, KF_CAND_KEYS), topk_json: kfRecord.topk_json || '', report_path: kfRecord.report_path || '' });
 // What runs ahead of the search gets a bounded share of it: under time_budget_s the fusion profile and the
 // region UTs together have a quarter of the search window left when the fusion profile starts, each agent
 // attempt within GEAK's own cap. The analysis reads a trace and source on no GPU: an hour per attempt.
@@ -3632,7 +3634,7 @@ const kfTimeout = (capMs) => () => Math.max(AGENT_TIMEOUT_FLOOR_MS, Math.min(age
 let KF_INPUTS = {};
 const kfRegions = new Map();   // fusion_id -> region of this run's fusion profile
 // The run's KernelFusion record (wfReturn.kernel_fusion), carried in state: a resumed run reuses its profile.
-const kfRecord = KF_ON ? { status: 'not_run', routed: [], accepted: [], unprepared: [], single_kernel_route: [],
+const kfRecord = KF_ON ? { status: 'not_run', routed: [], accepted: [], unprepared: [], single_kernel_route: [], handbacks: [],
   ...(ST.kernel_fusion && typeof ST.kernel_fusion === 'object' ? ST.kernel_fusion : {}) } : null;
 function kfAdopt(rec) {
   kfRegions.clear();
@@ -3724,7 +3726,8 @@ async function kfPrepare(c, gpu, previous, throughput) {
     PREVIOUS_UT_DELIVERY: (profile && profile.kernel_extraction_delivery_json) || '',
     TRACE_DIR: kfRecord.trace_dir,
     FUSION_SCOPE: [{ task: t, fusion_level: c.level, region: c.region, device_kernels: c.kernels || [],
-      phases: c.phases || [], seam: c.seam || {}, inputs_outputs: c.inputs_outputs || '', m_range: c.m_range || '' }],
+      phases: c.phases || [], seam: c.seam || {}, inputs_outputs: c.inputs_outputs || '', m_range: c.m_range || '',
+      analysis: kfAnalysisOf(c) }],
     SOURCE_DELIVERY_REQUIRED: true, REMAINING_MIN: Math.min(remainingMin(), Math.round(kfLeftMs() / 60000)),
     SKILL_DIR: WORKFLOW_DIR, ...TRACELENS_INPUTS, ...ANALYSIS_SKILL_INPUTS, ...KB_REF_INPUTS,
   };
@@ -3822,7 +3825,8 @@ function kfExpand(c) {
 const kfExtractIntro = (c) => (!kfRegionOf(c) ? '' : kfIntro(
   `Build the immutable unittest task dir for a FUSION REGION, not a single kernel. Read ${KF_UT_CONTRACT} first: ` +
   'its FUSION UT CONTRACT and its kernel_extractor section are your scope for this invocation.'));
-const kfExtractInputs = (c) => (kfRegionOf(c) && A.kf_workload_summary ? { WORKLOAD_SUMMARY: String(A.kf_workload_summary) } : {});
+const kfExtractInputs = (c) => (!kfRegionOf(c) ? {} : { FUSION_ANALYSIS: kfAnalysisOf(kfRegionOf(c)),
+  ...(A.kf_workload_summary ? { WORKLOAD_SUMMARY: String(A.kf_workload_summary) } : {}) });
 function kfLaneTask(c) {
   const r = kfRegionOf(c);
   if (!r) return '';
@@ -3891,6 +3895,8 @@ async function kfHeadCandidates(h) {
   const iso = !r ? 0 : KERNEL_EXTRACT_ON ? (r.final_weighted ?? r.final_speedup ?? 0)
     : (r.final_weighted != null ? r.final_weighted : r.final_geomean);
   if (!(iso > 1.0) || !r.final_patch) return fail(`no isolated speedup (${r ? r.reason || r.validation_status : 'lane not run'})`);
+  const hbWhy = await kfHandbackGate(c, x.task_dir, { ...r, final_weighted: iso }, 'HeadKernel');
+  if (hbWhy) return fail(`hand-back rejected (${hbWhy.slice(0, 300)})`);
   log(`  ${tag}: fused kernel ${iso.toFixed(2)}x weighted; it joins ${h.short_name}'s candidates.`);
   // kind 'authored' keeps the head's corrective re-author; winner_kind 'patch' banks it as the Milestone loop does.
   return [{ kind: 'authored', source: c.short_name, winner_kind: 'patch', language: c.candidate_backends[0],
@@ -3922,6 +3928,33 @@ async function kfOverlayGate(integ, inputs, phaseName) {
   log(`[kf] ${kr.short_name}: accepted overlay ${integ.accepted_overlay} failed validation: ${why}`);
   return { ...integ, gate: 'rejected', ab_complete: true, overlay_check: check || { ok: false, problems: [why] },
     reason: `overlay: accepted overlay failed validation: ${why}`.slice(0, 1500) };
+}
+
+// The hand-back of a region's kernel lane (scripts/fusion_handback.py): the directory every implementer of a
+// fusion region hands back (kernel_src/, support.json, init.py, ut_result.json, notes.md), assembled from the
+// lane's final_patch and the files the fusion-kernel skill has it write under kernel_src/_handback/, then
+// checked against the region UT before the A/B. '' when it passes, or for any other kernel; else why not.
+const KF_HANDBACK_SCHEMA = obj({ ok: { type: 'boolean' }, problems: arrStr, warnings: arrStr,
+  handback: { type: 'string' }, speedup: { type: 'number' } }, ['ok']);
+async function kfHandbackGate(c, taskDir, lane, phaseName) {
+  if (!kfRegionOf(c)) return '';
+  const out = `${EVAL_DIR}/kernel_fusion/handback/${c.short_name}`;
+  const ev = lane.kernel_eval_dir || lane.eval_dir || '';
+  const laneJson = JSON.stringify({ validation_status: lane.validation_status || '', timing_basis: lane.timing_basis || '',
+    final_weighted: lane.final_weighted ?? lane.isolated_speedup ?? null, final_geomean: lane.final_geomean ?? null,
+    report_path: lane.report_path || (ev ? `${ev}/tech_lead_report.md` : '') });
+  const res = await safeAgent('Run EXACTLY this command and nothing else:\n```bash\n' +
+    `python3 ${shq(`${WORKFLOW_DIR}/scripts/fusion_handback.py`)} assemble --check --task-dir ${shq(taskDir)} ` +
+    `--final-patch ${shq(lane.final_patch || '')} --out ${shq(out)} --lane-result ${shq(laneJson)} ` +
+    `--region ${shq(JSON.stringify({ phases: c.phases || [], m_range: c.m_range || '' }))}\n` + '```\nIt prints ' +
+    'one JSON object (and exits 1 when the check fails). Return that object EXACTLY as printed. Do NOT modify any ' +
+    'file and do NOT run anything else.',
+    { phase: phaseName, label: `handback ${c.short_name}`, effort: 'low', schema: KF_HANDBACK_SCHEMA }, 1, () => 10 * 60000);
+  const why = !res ? 'the hand-back check did not run' : res.ok === true ? '' : (res.problems || []).join('; ') || 'not ok';
+  kfRecord.handbacks.push({ short_name: c.short_name, handback: out, ok: !why, ...(why ? { reason: why.slice(0, 600) } : {}),
+    warnings: ((res && res.warnings) || []).slice(0, 5) });
+  if (why) log(`[kf] ${c.short_name}: hand-back rejected: ${why}`);
+  return why;
 }
 
 if (want('setup')) {
@@ -6328,6 +6361,14 @@ while (want('kernel') && !TIME_DEADLINE_HIT && dispatched < BUDGET && (dispatche
       log(`  ${c.short_name}: kernel layer produced no speedup (${kl ? kl.isolated_speedup : '?'}x); skipping integrate.`);
       history.ledger.push({ direction: c.short_name, isolated_speedup: kl ? kl.isolated_speedup : 0, verdict: 'dead_end', lesson: 'no isolated speedup' });
       continue;
+    }
+    if (KF_ON) {
+      const hbWhy = await kfHandbackGate(c, ext.task_dir, kl, 'Milestone');
+      if (hbWhy) {
+        history.ledger.push({ direction: c.short_name, isolated_speedup: kl.isolated_speedup, verdict: 'dead_end',
+          lesson: `hand-back rejected: ${hbWhy}`.slice(0, 600) });
+        continue;
+      }
     }
     log(`  ${c.short_name}: kernel layer ${kl.isolated_speedup.toFixed(2)}x isolated. Integrating to e2e.`);
     // Build inputs ONCE so Fix C can re-issue the SAME A/B for a pending win at Finalize.

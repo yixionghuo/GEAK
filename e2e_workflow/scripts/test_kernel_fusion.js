@@ -194,7 +194,23 @@ ok(k.status === 'accepted' && same(k.routed, ['kf_c2']) && k.accepted[0].fusion_
   'the record: profile, routed regions, accepts, verdicts (history.ledger); carried in state');
 ok(labels(on).includes('director:validate'), 'the run goes on to Validate');
 
+ok(ex.includes('FUSION_ANALYSIS') && ex.includes('"est_gain_pct_expected":1.5') && !promptOf(on, 'extract mk_gemm').includes('FUSION_ANALYSIS'),
+  'the region UT gets the region\'s analysis entry (written into the task as analysis.json)');
+const utc = fs.readFileSync(path.join(WF_DIR, 'roles', '_fragments', 'fusion_ut_contract.md'), 'utf8');
+ok(['## The unified task dir (L1–L4 share it)', '`level`', '`acceptance`', '`regime.speculative`', '**`analysis.json`**',
+  'controls/controls.json', 'run/controls_result.json', 'No `selfcheck.json`', '## The hand-back the UT is accepted against']
+  .every((k) => utc.includes(k)), 'fusion_ut_contract.md: the unified task dir and the hand-back it is accepted against');
+const hbp = promptOf(on, 'handback kf_c2');
+ok(before(on, 'handback kf_c2', 'integrate kf_c2') && hbp.includes('fusion_handback.py') && hbp.includes(`--task-dir '${EV}/tasks/kf_c2'`) &&
+  hbp.includes(`--out '${EV}/kernel_fusion/handback/kf_c2'`) && !labels(on).includes('handback mk_gemm') &&
+  kfOf(on).handbacks.length === 1 && kfOf(on).handbacks[0].ok === true,
+  'a region\'s lane result is assembled into the unified hand-back and checked before its A/B; a single kernel has none');
+
 console.log('\n## D. every outcome ends cleanly');
+const bhb = run('on_bad_handback');
+ok(!labels(bhb).includes('integrate kf_c2') && !names(bhb).includes('kf_c2') && names(bhb).includes('mk_gemm') &&
+  kfOf(bhb).handbacks[0].ok === false && labels(bhb).includes('director:validate'),
+  'a rejected hand-back never reaches the A/B, and the run goes on');
 const pend = run('on_pending');
 const fin = promptOf(pend, 'finish-integrate kf_c2');
 ok(/"op_kind": ?"fusion"/.test(fin) && /ACCURACY_GATE/.test(fin) && before(pend, 'finish-integrate kf_c2', 'overlay-check kf_c2'),
@@ -240,6 +256,7 @@ ok(before(ax, 'kernel_extractor:prepare baseline', 'fusion_analyst:analyze') &&
   'the analysis reads the baseline preparation\'s captures (KX_EVIDENCE_DIR)');
 const pk = promptOf(ax, 'kernel_extractor:prepare kf_c2');
 ok(/FUSION_SCOPE: \[\{"task":"kf_c2","fusion_level":"L1"/.test(pk) && pk.includes('fusion_ut_contract.md') &&
+  pk.includes('"analysis":{"id":"c2"') &&
   pk.includes('"device_kernels":["rms_norm_kernel","quant_kernel"]'),
   'each recommended region gets one kernel-extract invocation scoped to it');
 ok(same(kfOf(ax).unprepared, [{ id: 'c3', reason: 'no seam.target_callable' }]) &&
