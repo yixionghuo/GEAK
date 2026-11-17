@@ -106,6 +106,14 @@ def test_args_carry_every_candidate_and_only_what_the_workflow_reads(tmp_path):
     assert a["kf_topk"]["candidates"][0] == {"id": "c0", "seam": {"target_callable": "m:f"}, "fallback": "c9"}
 
 
+def test_a_given_topk_keeps_each_region_route(tmp_path):
+    t = tmp_path / "topk.json"
+    t.write_text(json.dumps({"candidates": [{"id": "a", "route": "single_kernel", "single_kernel_gain_pct_expected": 3.5,
+                                             "est_gain_pct_expected": 1.0}], "recommended": ["a"]}))
+    c = kfa.build_args({"topk_json": str(t)})["kf_topk"]["candidates"][0]
+    assert (c["route"], c["single_kernel_gain_pct_expected"]) == ("single_kernel", 3.5)
+
+
 def test_the_fusion_strategy_is_read_first_and_can_be_replaced_or_dropped(tmp_path):
     deploy = tmp_path / "deploy.txt"
     deploy.write_text("x")

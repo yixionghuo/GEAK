@@ -81,7 +81,9 @@ def prompt_files(cfg: dict) -> list[str]:
 # A given topk.json travels in the args: pass only what the workflow reads.
 CAND_KEYS = ("id", "rank", "level", "region", "kernels", "phases", "occurrences", "m_range", "seam", "inputs_outputs",
              "launches_before", "launches_after", "region_pct_device_time", "est_gain_pct_expected", "difficulty",
-             "bitwise_exact", "exclusive_with", "language", "fallback", "fused_design")
+             "bitwise_exact", "exclusive_with", "language", "fallback", "fused_design",
+             # the route against optimizing the region's kernels one by one: "single_kernel" is never prepared or routed
+             "single_kernel_gain_pct_expected", "route")
 
 
 def slim_topk(d: dict) -> dict:
