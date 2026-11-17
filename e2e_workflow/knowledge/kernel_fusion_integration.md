@@ -31,6 +31,21 @@ The fusion work is two skills under `knowledge/kernel_fusion_skills/`:
   region's heavy member first, fuses the neighbours on top of it, and keeps the best of stock / tuned
   member / tuned and fused at the region UT, guarded to its measured envelope.
 
+Every region, at any level and whoever implements it, uses one UT standard and one hand-back
+(`roles/_fragments/fusion_ut_contract.md`):
+
+- **UT**: GEAK's task dir, plus `meta.json` fields `level`, `analysis`, `cases` (step type × width ×
+  context, with served weights), `regime.speculative` and `acceptance`; `analysis.json` (the region's entry
+  of the fusion analysis); `controls/` + `controls.json` (negative controls another implementer can re-run;
+  their runs in `run/controls_result.json`). No `selfcheck.json`: `run/ut_result.json`,
+  `run/self_noise.json` and `run/controls_result.json` are the self-check.
+- **Hand-back**: `kernel_src/`, `support.json`, `init.py` (optional), `ut_result.json`, `notes.md`. A kernel
+  lane writes `support.json` / `notes.md` / `init.py` under `kernel_src/_handback/`; after the lane,
+  `scripts/fusion_handback.py assemble --check` builds the directory under
+  `EVAL_DIR/kernel_fusion/handback/<short_name>/` and checks it against the UT before the e2e A/B (a
+  rejected hand-back never reaches the A/B). `fusion_handback.py check --run` re-runs the UT on a hand-back
+  from outside GEAK.
+
 Levels L1–L3 are implemented (`kf_implementable_levels`). L3 MegaKernel and L4 MonoKernel are ranked by the
 analysis but not prepared or routed (`kf_unsupported_patterns`); they wait for the MonoKernel interface.
 
@@ -53,6 +68,7 @@ e2e_workflow/roles/_fragments/fusion_ut_contract.md
 e2e_workflow/knowledge/kernel_fusion_skills/fusion-kernel/
                                                 the fusion-kernel skill (SKILL.md, references/: tune-then-fuse,
                                                 FlyDSL), read by the kernel_lane.js run that writes the fused kernel
+e2e_workflow/scripts/fusion_handback.py        assembles a region lane's hand-back and checks it against the region UT (run through one agent)
 e2e_workflow/scripts/fusion_overlay_check.py    the on-disk check of an accepted region's overlay (run through one agent)
 interface/kernel_fusion_args.py                 the switch and knobs -> workflow args; the only KernelFusion code run_e2e.py calls
 ```

@@ -51,10 +51,26 @@ the best implementation the region's unit test can measure.
 6. **Keep it graph-capture safe** when the server captures decode into a CUDA/HIP graph: launch on the
    current stream, no host sync, no `.item()`, no Python branch on a GPU value, no allocation inside the
    captured region. The guard in step 5 must branch on host-side values only (shapes, flags).
-7. **Report** in your notes: the variant you delivered (A, B or C) and the weighted speedup of each one
-   you measured; per-case times; the envelope; launches before and after; whether the outputs are
-   bit-exact; served shapes or phases the cases lack, if you noticed any (the unittest is immutable: guard
-   off them instead of adding cases).
+7. **Write the hand-back files** under `kernel_src/_handback/` (they ride in your final patch; the workflow
+   moves them to the top of the region's hand-back directory, see "The hand-back" below):
+   - `support.json`: where the delivered implementation engages, the envelope of step 5:
+     `{"phases": [...], "m_range": "<rows it engages for>", "dtypes": [...], "refusals": ["<every case that goes to the stock path, and why>"]}`;
+   - `notes.md`: the variant you delivered (A, B or C) and the weighted speedup of each one you measured;
+     per-case times; launches before and after; whether the outputs are bit-exact; served shapes or phases
+     the cases lack, if you noticed any (the unittest is immutable: guard off them instead of adding cases);
+   - `init.py`, only when the implementation needs server start-up preparation (JIT of every width before
+     the KV cache is sized, registrations): a `prepare(ctx)` function.
+
+## The hand-back
+
+Every implementer of a fusion region, a kernel lane or an outside team, hands back the same directory:
+`kernel_src/`, `support.json`, `init.py` (optional), `ut_result.json`, `notes.md`. For a kernel lane the
+workflow assembles it (`e2e_workflow/scripts/fusion_handback.py assemble`): `kernel_src/` is the task's
+`kernel_src/` with your final patch applied, the three files above come from `kernel_src/_handback/`, and
+`ut_result.json` is your lane's own validation of the same unittest. It is checked against the region UT
+(layout, `support.json`, the code compiles, `meta.acceptance.min_speedup`) before the e2e A/B. Without your
+`support.json` the workflow derives one from the region's phases and rows and marks it `derived`: state the
+real envelope instead.
 
 ## Rules
 

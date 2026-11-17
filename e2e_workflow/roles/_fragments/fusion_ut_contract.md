@@ -35,6 +35,45 @@ The UT must not pin the current kernel structure:
 
 Record `"fusion_contract": true` in meta.json.
 
+## The unified task dir (L1–L4 share it)
+
+Every fusion region's UT, whatever its level and whoever implements it, is one GEAK task dir with these
+additions. L1–L3 use what is below; L3 MegaKernel and L4 add their layer-level fields later.
+
+- **`meta.json`**, beside the fields GEAK already writes:
+  - `fusion_contract: true`, `level` (`L1` / `L2` / `L3`);
+  - `analysis`: `"analysis.json"`;
+  - `cases`: one entry per served case, `{"sig", "step_type", "width", "context", "weight"}` (step_type:
+    prefill_chunk / decode / target_verify / draft; weight = its served share), the same signatures the
+    timing cases use;
+  - `regime.speculative`: `{"algorithm", "num_draft_tokens"}` from the server flags, `null` without
+    speculative decoding;
+  - `acceptance`: `{"min_speedup", "exact_outputs", "noise_bound"}`: the lowest weighted speedup a
+    hand-back must reach at this UT (1.0 unless `OPERATOR_CONSTRAINTS` says otherwise: the e2e A/B
+    decides the rest), the outputs that must match bit for bit (in-place writes such as a KV-cache slot;
+    `[]` when none), and the measured noise of the baseline against itself (`run/self_noise.json`).
+- **`analysis.json`**: the region's entry of the fusion analysis, as given in `FUSION_ANALYSIS` (or the
+  `analysis` of the `FUSION_SCOPE` entry): why it is fused, at what level, the expected gains of both
+  routes. Copy it; do not re-derive it.
+- **`controls/`**: the negative controls as files another implementer can re-run. Each control is a
+  directory `controls/<name>/` holding the files that replace their namesakes in `kernel_src/` (the seam
+  implementation with one thing broken); `controls/controls.json` lists them,
+  `{"<name>": {"what": "...", "must_fail": ["eager", ...]}}`. At least `perturb_output`: the seam's output
+  scaled by `1 + 4·tol`. Run every control with the task's own `unittest.py` (a copy of the task dir whose
+  `kernel_src/` files are replaced by the control's): each must exit 1 (correctness FAIL; a build or
+  import error does not count). Record the runs in `run/controls_result.json`, and point the source-delivery
+  record's `negative_control_ref` at it.
+- No `selfcheck.json`: the self-check is `run/ut_result.json` (the unchanged `kernel_src/` passes with
+  speedup ≈ 1.0), `run/self_noise.json` and `run/controls_result.json`.
+
+## The hand-back the UT is accepted against
+
+Whoever implements the region hands back one directory (`scripts/fusion_handback.py`): `kernel_src/` (the
+only change), `support.json` (`phases`, `m_range` or `widths`, `dtypes`, `refusals`: where it engages and
+where it falls back to the stock path), `init.py` (optional), `ut_result.json` (this UT's result on it) and
+`notes.md`. A GEAK kernel lane produces it through the fusion-kernel skill. KernelFusion checks it against
+this task dir (`acceptance.min_speedup`, the candidate_bind file) before the e2e A/B.
+
 ## AgentX: the kernel-extract skill (PHASE=prepare)
 
 Explicit user scope (overrides the default selection): build exactly ONE task for the single entry of
