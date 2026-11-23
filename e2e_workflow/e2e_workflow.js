@@ -3874,7 +3874,9 @@ function kfLaneTask(c) {
     suggested_design: r.fused_design || '', bitwise_exact_expected: !!r.bitwise_exact };
   return `FUSION REGION ${r.id} (${r.level || '?'}): write ONE fused ${lang} kernel that replaces this whole ` +
     `kernel region of a live LLM serving stack. Read ${KF_KERNEL_SKILL} and the references it links first. The region: ` +
-    JSON.stringify(region) + '. ' + GRAPH_REQ + (TASK || '') + (KF_TASK ? ` OPERATOR CONSTRAINTS: ${KF_TASK}` : '');
+    JSON.stringify(region) + '. ' + GRAPH_REQ + (TASK || '') + (KF_TASK ? ` OPERATOR CONSTRAINTS: ${KF_TASK}` : '') +
+    // Distinct prompts, so a Milestone lane retry never replays the failed attempt's cached agents.
+    (c.lane_retried ? ' (Retry after a kernel-lane error.)' : '');
 }
 // The integrate A/B of a region: its facts in KERNEL_RESULT and the accuracy gate, both in the inputs, so
 // the Finalize-gate's replay of a pending A/B and a corrective re-author keep them. {} for any other kernel.
@@ -6379,7 +6381,8 @@ while (want('kernel') && !TIME_DEADLINE_HIT && dispatched < BUDGET && (dispatche
         budget: KERNEL_BUDGET, gpu_ids: c.gpu_id, exp_root: `${EVAL_DIR}/kernels/_exp`,
         task: (KF_ON && kfLaneTask(c)) || 'Compare candidate backends ' + JSON.stringify(c.candidate_backends || []) +
           ' for this kernel; pick the fastest that passes the immutable unittest. ' + GRAPH_REQ + (TASK || '') +
-          // Distinct prompts, so the retry never replays the failed attempt's cached agents.
+          // Distinct prompts, so the retry never replays the failed attempt's cached agents (a fusion
+          // region's task text carries the same marker).
           (c.lane_retried ? ' (Retry after a kernel-lane error.)' : ''),
         apply_to_original: 'false',
       }, String(c.short_name || ext.op_kind || 'milestone'));
