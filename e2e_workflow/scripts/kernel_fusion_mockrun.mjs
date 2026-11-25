@@ -33,17 +33,23 @@ const CANDS = [
     seam: { target_callable: 'pkg.moe:prep' }, region_pct_device_time: 1, est_gain_pct_expected: 0.4 },
   { id: 'c3', rank: 4, level: 'L3', region: 'moe stage', kernels: ['a', 'b'], seam: {}, est_gain_pct_expected: 9 },
 ];
-// Every TopK single-kernel hotspot's gain alone (the analysis' "hotspots"); noise fields are dropped.
-const HOTSPOTS = [{ kernel: 'gemm_kernel', pct_gpu_time: 12, single_kernel_gain_pct_expected: 1.2, basis: 'untuned', x: 1 },
-  { kernel: 'gemm_bf16_kernel', pct_gpu_time: 20, single_kernel_gain_pct_expected: 2.5, basis: 'tuned lib' }];
+// Every TopK single-kernel hotspot's gain alone (the analysis' "hotspots"); noise fields are dropped. HeadKernel
+// orders by them: h_gemm (2.5) runs after its region kf_c4 (3), or before it (5) in the *_nowin scenarios; *_noest
+// gives none (h_gemm falls back to the Amdahl ceiling of its 20% at 1.2x, 3.45).
+const HOTSPOTS = scenario.includes('noest') ? [] : [
+  { kernel: 'gemm_kernel', pct_gpu_time: 12, single_kernel_gain_pct_expected: 1.2, basis: 'untuned', x: 1 },
+  { kernel: 'gemm_bf16_kernel', pct_gpu_time: 20, single_kernel_gain_pct_expected: scenario.includes('nowin') ? 5 : 2.5,
+    basis: 'tuned lib' }];
 // The head scenarios add c4, an L2 region on the head h_gemm's own kernel (GEMM + bias + GELU).
 const C4 = { id: 'c4', rank: 5, level: 'L2', region: 'gemm + bias + gelu', kernels: ['gemm_bf16_kernel', 'gelu_kernel'],
   seam: { target_callable: 'pkg.mlp:MLP.forward' }, region_pct_device_time: 22, est_gain_pct_expected: 3 };
 // on_agentx_route: the analysis judges c1 worth more as single-kernel work (route single_kernel) but still
 // lists it in "recommended": the workflow must drop it.
 const ROUTE = scenario.includes('route');
+// on_head_kfhigh: c2 is estimated above every head, so its own slot runs first.
 const REGIONS = (HEAD ? [...CANDS, C4] : CANDS).map((c) => (ROUTE && c.id === 'c1'
-  ? { ...c, route: 'single_kernel', single_kernel_gain_pct_expected: 3.5 } : c));
+  ? { ...c, route: 'single_kernel', single_kernel_gain_pct_expected: 3.5 }
+  : scenario.includes('kfhigh') && c.id === 'c2' ? { ...c, est_gain_pct_expected: 9 } : c));
 const ext = (id) => ({ short_name: id, editable: true, task_dir: `${EV}/tasks/${id}`, unittest_smoke: 'pass',
   baseline_frozen: true, target_callable: `pkg.${id}:f`, source_path_in_sglang: `pkg/${id}.py` });
 // A head GEAK's own admission and kernel-selection checks accept: a profiled gpu_kernel with one inner launcher.
@@ -75,7 +81,7 @@ const MK_GEMM = { short_name: 'mk_gemm', pct_gpu_time: 12, device_kernel: 'gemm_
 const KF_C2 = { short_name: 'kf_c2', fusion_id: 'c2', pct_gpu_time: 6, candidate_backends: ['triton'] };
 const KF_C4 = { short_name: 'kf_c4', fusion_id: 'c4', pct_gpu_time: 22, candidate_backends: ['triton'] };
 const routed = LIKE_OFF ? [MK_NORM, MK_GEMM] : {
-  off: [], off_false: [], off_head: [MK_GEMM],
+  off: [], off_false: [], off_head: [MK_GEMM], off_head_nowin: [MK_GEMM], off_head_unrun: [MK_GEMM],
   on_unknown: [{ short_name: 'k_x', fusion_id: 'zz', classification: 'fusion', pct_gpu_time: 7, candidate_backends: ['triton'] }],
 }[scenario] || (HEAD ? [KF_C4, KF_C2] : [KF_C2, MK_GEMM]);
 // h_gemm's candidates: the fused kf_c4 (on), the bake-off's env winner and an authored triton kernel.
@@ -90,11 +96,13 @@ const answers = {
   'profiler:reprofile m1': () => ({ profile_topN_json: `${EV}/profile/round_1/profile_topN.json`, top_kernels: [] }),
   'profiler:post-head': () => ({ profile_topN_json: `${EV}/profile/round_head/profile_topN.json`, top_kernels: [] }),
   'architect:strategize': () => ({ head_candidates: HEAD ? [H_GEMM] : [], config_directions: [], kernel_candidates: routed }),
-  // on_head_unrun: the head's extraction fails before its A/B, so kf_c4 stays queued for the Milestone loop.
-  'extract_op h_gemm': () => (scenario === 'on_head_unrun' ? { op_kind: 'gemm', task_dir: '', smoke: 'fail',
+  // *_unrun: the head's extraction fails; *_nowin: its bake-off finds no win and nothing to author.
+  'extract_op h_gemm': () => (scenario.endsWith('_unrun') ? { op_kind: 'gemm', task_dir: '', smoke: 'fail',
     smoke_detail: 'capture failed' } : H_EXT),
-  'bakeoff h_gemm': () => ({ gate: 'have_winner', isolated_speedup: 1.2, measured: true, winner_backend: 'aiter',
-    winner_kind: 'env', apply_env: 'AITER_TUNED=1', best_known_ms: 0.5, author_plan: [{ language: 'triton', route: 'author' }] }),
+  'bakeoff h_gemm': () => (scenario.endsWith('_nowin') ? { gate: 'no_win', isolated_speedup: 1.0, measured: true,
+    reason: 'the library kernel is already at its floor', author_plan: [] }
+    : { gate: 'have_winner', isolated_speedup: 1.2, measured: true, winner_backend: 'aiter',
+      winner_kind: 'env', apply_env: 'AITER_TUNED=1', best_known_ms: 0.5, author_plan: [{ language: 'triton', route: 'author' }] }),
   'extract kf_c4': () => ext('kf_c4'),
   // The fused kernel wins (on_head), clears the gate below the bake-off's winner (on_head_loses), does not
   // finish its A/B until the Finalize-gate (on_head_pending), or fails live in a fixable way (on_head_fix).
@@ -127,7 +135,7 @@ const answers = {
   'integrate mk_gemm (finish 3)': () => integ('mk_gemm', 'incomplete', 0),
   'finish-integrate mk_gemm': () => integ('mk_gemm', 'accepted', 20),
   'integrate kf_c2': () => (scenario === 'on_pending' ? integ('kf_c2', 'incomplete', 0, { reason: 'server never healthy' })
-    : fusedInteg('kf_c2', 2, HEAD ? { e2e_throughput_tok_s: 110 } : {})),
+    : fusedInteg('kf_c2', 2, HEAD || AGX ? { e2e_throughput_tok_s: 110 } : {})),
   'integrate kf_c2 (finish 1)': () => integ('kf_c2', 'incomplete', 0),
   'integrate kf_c2 (finish 2)': () => integ('kf_c2', 'incomplete', 0),
   'integrate kf_c2 (finish 3)': () => integ('kf_c2', 'incomplete', 0),
@@ -151,8 +159,9 @@ const answers = {
   'kernel_extractor:prepare kf_c1': () => prepared('kf_c1', [['kf_c1', 4, 'fusion']]),
   'kernel_extractor:prepare kf_c2': () => prepared('kf_c2', [['kf_c2', 6, 'fusion']]),
   'kernel_extractor:prepare kf_c4': () => prepared('kf_c4', [['kf_c4', 22, 'fusion']]),
-  'integrate k_norm': () => integ('k_norm', 'accepted', 2, { e2e_throughput_tok_s: 104 }),
-  'integrate kf_c1': () => fusedInteg('kf_c1', 1, { e2e_throughput_tok_s: 105 }),
+  // AgentX runs best estimate first: kf_c1 (2.7), kf_c2 (1.5), k_norm (Amdahl 0.84), each above the last.
+  'integrate k_norm': () => integ('k_norm', 'accepted', 2, { e2e_throughput_tok_s: 120 }),
+  'integrate kf_c1': () => fusedInteg('kf_c1', 1, { e2e_throughput_tok_s: HEAD ? 108 : 101 }),
   'overlay-check kf_c1': () => ({ ok: true, problems: [], manifest_sha256: 'c'.repeat(64), files: 4 }),
 };
 
@@ -168,7 +177,8 @@ const backend = {
     const hb = String(label).startsWith('handback ') ? () => ((scenario === 'on_bad_handback' && label === 'handback kf_c2')
       ? { ok: false, problems: ['support.json is missing or not a JSON object'], warnings: [] }
       : { ok: true, problems: [], warnings: [], handback: `${EV}/kernel_fusion/handback/${label.slice(9)}`, speedup: 1.3 }) : null;
-    const a = answers[label] || hb;
+    // A region-only HeadKernel slot is named after its region: "integrate kf_c2:kf_c2" answers as "integrate kf_c2".
+    const a = answers[label] || answers[String(label).replace(/^integrate (kf_c\d):\1\b/, 'integrate $1')] || hb;
     return { text: JSON.stringify(a ? a(prompt) : null) };
   },
 };
@@ -191,8 +201,9 @@ const args = {
   ...(scenario === 'on_fast' ? { fast_mode: 'true' } : {}),
   ...(scenario === 'on_deep' ? { deep_mode: 'true' } : {}),
   ...(scenario === 'on_config_error' ? { kf_config_errors: 'kf_trace_dir does not exist: /nope' } : {}),
-  ...(scenario === 'on_topk' ? { kf_topk_json: '/data/topk.json', kf_topk: { recommended: ['c1', 'c2'],
+  ...(scenario === 'on_topk' ? { kf_topk_json: '/data/topk.json', kf_topk: { recommended: ['c1', 'c2'], hotspots: HOTSPOTS,
     candidates: CANDS.map((c) => (c.id === 'c2' ? { ...c, seam: C2_SEAM } : c)) } } : {}),
+  ...(scenario.includes('budget1') ? { head_budget: 1 } : {}),
   ...(scenario === 'on_setup' ? { phases: 'setup' } : {}),
   ...(scenario === 'on_resume' ? { phases: 'kernel,final',
     state: JSON.parse(await readFile(process.env.KF_MOCK_STATE, 'utf8')) } : {}),

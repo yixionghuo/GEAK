@@ -3805,7 +3805,7 @@ function kfMerge(queue, fused) {
   const out = (queue || []).slice();
   for (const f of fused) {
     if (out.some((q) => q && q.short_name === f.short_name)) continue;
-    const at = out.findIndex((q) => !(Number(q && q.pct_gpu_time) >= Number(f.pct_gpu_time)));
+    const at = out.findIndex((q) => !(estGainPct(q || {}) >= estGainPct(f)));
     out.splice(at < 0 ? out.length : at, 0, f);
   }
   return out;
@@ -3864,22 +3864,70 @@ function kfBanked(rec) {
     short_name: rec.short_name, fusion_id: rec.fusion_id || '', isolated_speedup: rec.isolated_speedup,
     e2e_delta_pct: rec.e2e_delta_pct }]);
 }
-// HeadKernel: a queued region whose kernels include a head's own (typically GEMM or attention plus its
-// neighbors) leaves the kernel queue for that head's slot when the head reaches its A/B, as one more candidate:
-// its region UT and one fused kernel from kernel_lane.js, measured against the reference the head's other
-// candidates share, so it lands only by beating them. A head that never gets here leaves its region to the
-// Milestone loop.
-async function kfHeadCandidates(h) {
-  const own = [requiredDeviceKernel(h), ...kfList(h.selected_device_kernels)].filter(Boolean);
-  const at = kernelQueue.findIndex((k) => {
+// One unit for every candidate, the expected weighted e2e %: a region's own estimate; a single kernel's from the
+// analysis' hotspots, else the Amdahl ceiling of its GPU-time share at KF_SINGLE_SPEEDUP_PRIOR.
+const KF_SINGLE_SPEEDUP_PRIOR = parseFloat(A.kf_single_speedup_prior) || 1.2;
+const kfOwnKernels = (h) => [requiredDeviceKernel(h), h.device_kernel, ...kfList(h.selected_device_kernels)].filter(Boolean);
+function kfGain(c) {
+  const r = kfRegionOf(c);
+  if (r) return { pct: Number(r.est_gain_pct_expected) || 0, basis: r.gain_basis || 'est_gain_pct_expected' };
+  const own = kfOwnKernels(c);
+  const hs = (kfRecord.hotspots || []).find((x) => x.single_kernel_gain_pct_expected != null &&
+    own.some((d) => kernelIdentitiesMatch(x.kernel, d)));
+  if (hs) return { pct: Number(hs.single_kernel_gain_pct_expected) || 0, basis: `hotspot: ${hs.basis || hs.kernel}` };
+  const a = amdahlCeilingPct(c.pct_gpu_time, KF_SINGLE_SPEEDUP_PRIOR);
+  return { pct: Number.isFinite(a) ? a : 0, basis: `amdahl(pct_gpu_time ${c.pct_gpu_time || 0}, ${KF_SINGLE_SPEEDUP_PRIOR}x)` };
+}
+const estGainPct = (c) => kfGain(c).pct;
+// The Milestone queue best estimate first; as it is without a fusion profile (KernelFusion then changes nothing).
+const kfByGain = (q) => (!kfRegions.size ? q : (q || []).slice().sort((a, b) => estGainPct(b) - estGainPct(a)));
+// HeadKernel: one slot per head, joined by every queued fusion region whose kernels include the head's own
+// (typically GEMM or attention plus its neighbors); every other queued fusion region is a slot of its own.
+// Slots run best estimate first, HEAD_BUDGET of them; a region of a slot not run stays queued for the
+// Milestone loop. Inside a slot the candidates run best estimate first, a region as its region UT and one fused
+// kernel from kernel_lane.js, and all of them meet in the slot's one A/B, against one shared reference.
+const kfIsFusion = (k) => { const r = kfRegionOf(k); return !!r && r.route !== 'single_kernel'; };
+const kfSlotRegions = (h, regions) => regions.filter((k) =>
+  kfList(kfRegionOf(k).kernels).some((n) => kfOwnKernels(h).some((d) => kernelIdentitiesMatch(n, d))));
+function kfSlots() {
+  const regions = kernelQueue.filter(kfIsFusion), taken = new Set();
+  const own = (rs) => rs.filter((k) => !taken.has(k) && taken.add(k));
+  const slots = headQueue.map((c, i) => ({ h: { ...c, short_name: c.short_name || `${c.op_kind || 'op'}${i}` } }));
+  for (const sl of slots) sl.kf = own(kfSlotRegions(sl.h, regions));
+  for (const k of own(regions)) {
     const r = kfRegionOf(k);
-    return !!r && kfList(r.kernels).some((n) => own.some((d) => kernelIdentitiesMatch(n, d)));
-  });
+    // prepared_ut: a fresh object no head shares, so AgentX's consumed-head filter keeps every head.
+    slots.push({ kf: [k], h: { short_name: k.short_name || kfShortOf(r), kf_only: true, prepared_ut: {},
+      pct_gpu_time: typeof k.pct_gpu_time === 'number' ? k.pct_gpu_time : (r.region_pct_device_time || 0) } });
+  }
+  for (const sl of slots) {
+    sl.headGain = sl.h.kf_only ? -Infinity : estGainPct(sl.h);
+    sl.kf = kfByGain(sl.kf);
+    sl.gain = Math.max(sl.headGain, ...sl.kf.map(estGainPct));
+  }
+  const pick = slots.sort((a, b) => b.gain - a.gain).slice(0, HEAD_BUDGET);
+  pick.forEach((sl, i) => Object.assign(sl.h, { idx: i, gpu_id: GPU_LIST[i % GPU_LIST.length] }));
+  const row = (c, kind) => ({ short_name: c.short_name || kfShortOf(kfRegionOf(c)), kind,
+    est_gain_pct: +estGainPct(c).toFixed(3), basis: kfGain(c).basis });
+  kfRecord.schedule = pick.map((sl) => ({ slot: sl.h.short_name, candidates: [...(sl.h.kf_only ? [] : [row(sl.h, 'head')]),
+    ...sl.kf.map((k) => row(k, 'fusion'))].sort((a, b) => b.est_gain_pct - a.est_gain_pct) }));
+  log(`[kf] HeadKernel schedule (best estimate first, ${pick.length} of ${slots.length} slot(s)): ` + kfRecord.schedule
+    .map((sl) => `${sl.slot} [${sl.candidates.map((c) => `${c.short_name} ${c.est_gain_pct}%`).join(', ')}]`).join('; '));
+  return pick;
+}
+// The slot's regions estimated above its head (first) or not (after it): each a fused candidate, or none.
+async function kfSlotCands(sl, first) {
+  const out = [];
+  for (const k of sl.kf) if ((estGainPct(k) > sl.headGain) === first) out.push(...(await kfSlotCand(sl.h, k)));
+  return out;
+}
+async function kfSlotCand(h, k) {
+  const at = kernelQueue.indexOf(k);
   if (at < 0 || laneWindowShort(`fused lane ${h.short_name}`)) return [];
   const c = { ...kfExpand(kernelQueue.splice(at, 1)[0]), gpu_id: h.gpu_id };
   const tag = `${h.short_name}:${c.short_name}`;
   const fail = (lesson) => {
-    log(`  ${tag}: ${lesson}; the head goes on with its own candidates.`);
+    log(`  ${tag}: ${lesson}; the slot goes on with its other candidates.`);
     history.ledger.push({ direction: tag, verdict: 'dead_end', lesson });
     return [];
   };
@@ -3919,6 +3967,9 @@ function kfHeadResult(cand) {
     target_callable: x.target_callable || c.target_callable, pct_gpu_time: c.pct_gpu_time, ...kfResultFields(c) };
 }
 const kfHeadPct = (cand) => (cand.kf ? cand.kf.pct_gpu_time : 0);
+// A slot whose head route left no op UT (a region-only slot, or a failed head extract): the A/B's op is the region's.
+const kfSlotExt = (cands) => { const c = cands.find((x) => x.kf); return c && { ...kfHeadSpec(c), op_kind: 'fusion',
+  target_callable: c.kfx.target_callable || c.kf.target_callable }; };
 const kfHeadSpec = (cand) => (!cand.kf ? {} : { op_kind: cand.kfx.op_kind, shapes: cand.kfx.shapes,
   dtype: cand.kfx.dtype, task_dir: cand.kfx.task_dir, pct_gpu_time: cand.kf.pct_gpu_time });
 // A region's accepted overlay is checked on disk before any caller banks it (scripts/fusion_overlay_check.py):
@@ -5932,17 +5983,28 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
       }
     }
   } else {
-  for (const h of heads) {
+  // KF on with a fusion profile: gain-ordered slots of heads and fusion regions; else one slot per head, as before.
+  const slots = (KF_ON && !FAST_MODE && kfRegions.size) ? kfSlots() : heads.map((h) => ({ h }));
+  for (const slot of slots) {
+    const h = slot.h;
     // Budget guard: start no new head op after a dispatch deadline (FAST_DEADLINE_HIT in fast mode;
     // TIME_DEADLINE_HIT in all modes when time_budget_s is set).
     if ((FAST_MODE && FAST_DEADLINE_HIT) || TIME_DEADLINE_HIT) {
-      log(`[budget] dispatch deadline reached — stopping head dispatch before ${h.short_name} (${headDispatched}/${heads.length} heads done).`);
+      log(`[budget] dispatch deadline reached — stopping head dispatch before ${h.short_name} (${headDispatched}/${slots.length} heads done).`);
       break;
     }
     headDispatched++;
     if (KERNEL_EXTRACT_ON) headQueue = headQueue.filter(c => c.prepared_ut !== h.prepared_ut);
     // B4 measures THIS head's trial against its own start, not the run clock.
     const ablHeadStart = ELAPSED_MS;
+    const isDominant = !h.kf_only && (h.pct_gpu_time || 0) >= HEAD_PROTECT_PCT;
+    const headCands = [];
+    // A slot's fused candidates estimated above its head run first; the head's own route ending (a failed
+    // extract, a no-win bake-off) ends only that route, never the slot.
+    if (KF_ON && slot.kf) headCands.push(...(await kfSlotCands(slot, true)));
+    let headExt = null, routeEnded = false;
+    headRoute: {
+    if (h.kf_only) { routeEnded = true; break headRoute; }
     // (h1) Extract the op into a standalone immutable unittest (fused heads stay fused: gemmSynthFor).
     const ext = await extractWithBaseline(
       'kernel_extractor', 'extract_op', 'Build a standalone op unittest for a head kernel.', {
@@ -5956,7 +6018,6 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
         PREFILL_M_NOTE: 'also include the profiled large prefill M (chunk size, ~thousands) per (N,K)',
       },
       { phase: 'HeadKernel', label: `extract_op ${h.short_name}`, schema: EXTRACT_OP_SCHEMA });
-    const isDominant = (h.pct_gpu_time || 0) >= HEAD_PROTECT_PCT;
     if (!ext || ext.smoke !== 'pass' || !ext.task_dir) {
       const why = extractFailWhy(ext);
       if (isDominant) {
@@ -5967,8 +6028,9 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
         log(`  ${h.short_name}: op extraction failed (${why}); skipping.`);
         history.ledger.push({ direction: h.short_name, verdict: 'dead_end', lesson: 'op extraction failed' });
       }
-      continue;
+      routeEnded = true; break headRoute;
     }
+    headExt = ext;
     // (h2) DISCOVER existing impls + tune cheap levers + DECIDE an author_plan.
     const bake = await safeAgent(
       roleAgent('op_benchmarker', 'bakeoff', 'DISCOVER existing impls, tune cheap levers, DECIDE author_plan.', {
@@ -5987,17 +6049,16 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
         log(`  ⚠️ FLAG ${h.short_name}: ${isDominant ? `DOMINANT head (${(h.pct_gpu_time || 0).toFixed(1)}% GPU)` : 'head'} bake-off gate=${gate}${harness ? ' (HARNESS ERROR — bake-off could not measure; NOT a real no-win)' : ''}. ${hasPlan ? 'Proceeding to author route anyway.' : 'No author_plan to fall back on.'}`);
         flaggedHeads.push({ short_name: h.short_name, pct_gpu_time: h.pct_gpu_time, stage: 'bakeoff', gate, harness_error: harness, had_author_plan: hasPlan, reason: bake ? bake.reason || gate : 'bakeoff returned null' });
         history.ledger.push({ direction: h.short_name, isolated_speedup: bake ? bake.isolated_speedup : 0, verdict: harness ? 'harness_error' : 'flagged', lesson: bake ? bake.reason || gate : 'bakeoff null' });
-        if (!hasPlan) continue;       // can't author -> FLAGGED (surfaced in report), not a silent skip
+        if (!hasPlan) { routeEnded = true; break headRoute; }   // can't author -> FLAGGED (surfaced in report), not a silent skip
         // else: fall through to the author route below (do NOT continue)
       } else {
         log(`  ${h.short_name}: no win and nothing worth authoring (${bake ? bake.reason || gate : 'none'}); skipping.`);
         history.ledger.push({ direction: h.short_name, isolated_speedup: bake ? bake.isolated_speedup : 0, verdict: 'dead_end', lesson: bake ? bake.reason || 'no op win' : 'bakeoff failed' });
-        continue;
+        routeEnded = true; break headRoute;
       }
     }
 
     // Build the candidate list: the cheap direct_light winner (if any) + any authored implementations.
-    const headCands = [];
     if (bake.gate === 'have_winner' && bake.isolated_speedup > 1.0) {
       headCands.push({ kind: 'direct_light', source: bake.winner_backend, winner_kind: bake.winner_kind,
         apply_env: bake.apply_env || '', apply_flags: bake.apply_flags || '', code_patch: bake.code_patch || '',
@@ -6110,8 +6171,11 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
         history.ledger.push({ direction: `${h.short_name}:${lang}`, verdict: 'dead_end', lesson: al ? al.reason || 'author no speedup' : 'author failed' });
       }
     }
-    if (KF_ON) headCands.push(...(await kfHeadCandidates(h)));
+    } // end headRoute
+    if (KF_ON && slot.kf) headCands.push(...(await kfSlotCands(slot, false)));
+    const ext = (KF_ON && !headExt) ? kfSlotExt(headCands) : headExt;
     if (!headCands.length) {
+      if (routeEnded) continue;    // the route already said why
       if (isDominant) {
         log(`  ⚠️ FLAG ${h.short_name}: DOMINANT head (${(h.pct_gpu_time || 0).toFixed(1)}% GPU) produced NO candidate (bake-off + author route both empty) — flagged, NOT silently skipped.`);
         if (!flaggedHeads.some(f => f.short_name === h.short_name)) {
@@ -6274,11 +6338,11 @@ while (want('kernel') && !TIME_DEADLINE_HIT && dispatched < BUDGET && (dispatche
   phase('Milestone');
   let plan;
   if (KERNEL_EXTRACT_ON) {
-    plan = { stop: !kernelQueue.length, kernel_candidates: kernelQueue };
+    plan = { stop: !kernelQueue.length, kernel_candidates: KF_ON ? kfByGain(kernelQueue) : kernelQueue };
     kernelQueue = [];
   } else {
     plan = (milestone === 1 && kernelQueue.length)
-      ? { stop: false, kernel_candidates: kernelQueue }
+      ? { stop: false, kernel_candidates: KF_ON ? kfByGain(kernelQueue) : kernelQueue }
       : await safeAgent(
         roleAgent('system_architect', 'plan_milestone', `Nominate next kernels — ONLY editable kernels with pct_gpu_time >= ${MILESTONE_MIN_PCT}% (below that, Amdahl says they can't move e2e; do not nominate them even to meet the floor). Each candidate MUST carry its pct_gpu_time.`, {
           EVAL_DIR, ROUND: milestone, BUDGET_REMAINING: remaining, CURRENT_THROUGHPUT: curTput,

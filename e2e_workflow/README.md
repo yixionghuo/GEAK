@@ -412,10 +412,10 @@ input). **The milestone loop** then treats a region like any kernel candidate: a
 `roles/_fragments/fusion_ut_contract.md`, one fused kernel from a `kernel_lane.js` run that follows the
 co-optimization skill's fusion kernel prompt and the `fusion-kernel` skill (parity floor first, then fuse), and the integrate
 A/B on the overlay accepted so far, with its finish retries, speedup review, corrective re-author and
-Finalize-gate replay. A region on a head's own kernel (typically an L2 region on a GEMM or attention head) is built
-the same way in **HeadKernel** instead, as one more candidate in that head's slot: the head's A/B measures
-it against the reference its own candidates share and banks the best measured one, and a head HeadKernel
-never reaches leaves its region to the milestone loop. Off, it injects nothing: no prompt, log line, lane or return field changes
+Finalize-gate replay. **HeadKernel** runs slots best estimated gain first (`kernel_fusion.schedule`): each head
+joined by the regions on its own kernels (typically an L2 region on a GEMM or attention head), and every other
+region a slot of its own; the head's A/B measures every candidate of the slot against one reference and banks
+the best measured one, and a region of a slot past `head_budget` goes to the milestone loop. Off, it injects nothing: no prompt, log line, lane or return field changes
 (`scripts/test_kernel_fusion.js` runs the whole workflow both ways).
 
 **An accept is not taken on trust.** A region's A/B is held to task accuracy (a fused kernel reorders
