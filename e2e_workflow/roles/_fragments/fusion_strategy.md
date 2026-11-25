@@ -48,9 +48,10 @@ A region you pick is ONE entry of `kernel_candidates` (never `head_candidates`):
 - A region on a head op (one whose `kernels` include the kernel of a head you route in `head_candidates`,
   typically an L2 region: GEMM plus its bias/activation/quant, attention plus its local pre/post-processing)
   is routed here all the same, and that head op stays in `head_candidates` exactly as it would without the
-  region. When HeadKernel reaches the head's A/B, the workflow moves the region into the head's slot as one
-  more candidate beside the head's own, all measured against the same reference; the best measured one
-  lands. A head HeadKernel never reaches leaves its region to the Milestone loop.
+  region. HeadKernel runs the region in the head's slot as one more candidate beside the head's own, in
+  estimated-gain order, all measured against the same reference; the best measured one lands. A routed region
+  on no head's kernel may get a HeadKernel slot of its own when its estimate ranks it among the best
+  `head_budget` slots; otherwise the Milestone loop runs it.
 - HISTORY names a region tried in a head's slot `<head short_name>:kf_<id>`; it counts as tried, like a
   region the Milestone loop ran.
 - Kernels that rebind the same callable or whose regions overlap (exclusive_with) cannot go in together --

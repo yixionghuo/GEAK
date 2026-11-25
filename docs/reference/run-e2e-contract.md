@@ -134,11 +134,15 @@ workflow (`kernel_lane.js`, following the `co-optimization` skill's fusion
 kernel prompt and the `fusion-kernel` skill: parity floor first, done when the
 fused kernel is no slower than that floor on every case), and the run's own integrate A/B on the overlay
 accepted so far (gsm8k accuracy gate, then throughput), finished at the
-Finalize-gate when it is still pending. A region on a head's own kernel is
-built the same way in HeadKernel instead, as one more candidate in that head's
-slot, and banked only if it measures best against the reference the head's
-own candidates share; a head HeadKernel never reaches leaves its region to the
-milestone loop. A banked region is carried like any accepted kernel, and
+Finalize-gate when it is still pending. HeadKernel runs slots in order of
+estimated gain (weighted e2e %: a region's own estimate, a head's from the
+analysis' `hotspots`, else the Amdahl ceiling of its GPU-time share at
+`kf_single_speedup_prior`, default 1.2x): each head with the regions on its
+own kernels, every other region a slot of its own, `head_budget` slots. A
+slot's candidates run best estimate first and meet in one A/B against a shared
+reference; a head's failed extract or no-win bake-off does not drop its
+regions, and a region of a slot not run goes to the milestone loop, which is
+ordered by the same estimate. The order is recorded as `schedule`. A banked region is carried like any accepted kernel, and
 Finalize ships it. A fusion profile that fails, finds
 nothing or is switched off leaves the run exactly as it is without KF.
 
@@ -154,7 +158,8 @@ CLI flags (`--kernel-fusion` / `--no-kernel-fusion`), the
   "kernel_fusion": {
     "prompt": "/path/deployment_notes.txt",   // run-specific prompt(s), comma-separated
     "implementable_levels": "L1,L2,L3",
-    "task": "operator constraints for every KernelFusion agent"
+    "task": "operator constraints for every KernelFusion agent",
+    "single_speedup_prior": 1.2               // kf_single_speedup_prior: a single kernel's assumed speedup when unestimated
   }
 }
 ```
@@ -253,6 +258,7 @@ The workflow writes the following fields to the result file.
     "recommended": ["c2", "c1"],
     "single_kernel_route": ["c5"],       // regions the analysis left to single-kernel work (never routed)
     "hotspots": [{"kernel": "gemm_kernel", "pct_gpu_time": 12, "single_kernel_gain_pct_expected": 1.2, "basis": "..."}],
+    "schedule": [{"slot": "h_gemm", "candidates": [{"short_name": "kf_c4", "kind": "fusion", "est_gain_pct": 3, "basis": "..."}]}],
     "handbacks": [{"short_name": "kf_c2", "handback": ".../kernel_fusion/handback/kf_c2", "ok": true, "warnings": []}],
     "routed": ["kf_c2"],                 // regions the architect sent to the kernel track
     "unprepared": [ /* AgentX: recommended regions without a passing region UT, with the reason */ ],

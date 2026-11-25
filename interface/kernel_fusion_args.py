@@ -36,6 +36,8 @@ _KNOBS = {
     "implementable_levels": ("GEAK_KF_IMPLEMENTABLE_LEVELS", "kf_implementable_levels"),
     "unsupported_patterns": ("GEAK_KF_UNSUPPORTED_PATTERNS", "kf_unsupported_patterns"),
     "task": ("GEAK_KF_TASK", "kf_task"),
+    # a single kernel's assumed speedup when the analysis gave no estimate (HeadKernel's Amdahl fallback)
+    "single_speedup_prior": ("GEAK_KF_SINGLE_SPEEDUP_PRIOR", "kf_single_speedup_prior"),
 }
 _PATH_ARGS = ("kf_prompt", "kf_trace_dir", "kf_workload_summary", "kf_topk_json")
 

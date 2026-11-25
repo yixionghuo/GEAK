@@ -8,10 +8,18 @@ switch), it is not a phase of its own: it is broken down into the stages GEAK al
   `fusion-analysis` skill).
 - **Strategize** routes the regions worth a fused kernel into the kernel track, as kernel candidates
   that name a `fusion_id` (the Feasibility Review, now the System Architect's).
-- **HeadKernel** takes a routed region that covers one of its heads' own kernels (typically an L2 region on
-  a GEMM or attention head) as one more candidate in that head's slot: the region UT and the fused kernel are
-  built there, and the head's A/B measures it against the reference the head's own candidates share, so
-  the best measured one lands. A head HeadKernel never reaches leaves its region to the Milestone loop.
+- **HeadKernel** runs one queue of slots ordered by estimated gain (`estGainPct`, weighted e2e %: a region's
+  `est_gain_pct_expected`; a head's `single_kernel_gain_pct_expected` from the analysis' `hotspots`, else the
+  Amdahl ceiling of its GPU-time share at `kf_single_speedup_prior`, default 1.2x). Each head is a slot, joined
+  by every routed region that covers one of its kernels (typically an L2 region on a GEMM or attention head);
+  every other routed `fusion` region is a slot of its own. The `head_budget` best slots run; a region of a slot
+  not run stays queued for the Milestone loop. Inside a slot the candidates run best estimate first: the head's
+  own route (extract, bake-off, author) unchanged, a region as its region UT and one fused kernel; a head's
+  failed extract or no-win bake-off ends only the head's route. Then every candidate of the slot meets in the
+  head's A/B, against one shared reference, and the best measured one lands (a region-only slot runs the same
+  A/B with the region's UT). The order and estimates are `kernel_fusion.schedule`. The Milestone queue is
+  ordered by the same estimate. Without a fusion profile (switched off, failed, empty) HeadKernel and the
+  Milestone order are exactly GEAK's own.
 - **The Milestone loop** builds, optimizes and measures every other routed region like any kernel
   candidate: a region UT (extract), a fused kernel (`kernel_lane.js`), then the integrate A/B on the
   overlay accepted so far. An accepted region's overlay is checked on disk before it is banked, in either
@@ -165,6 +173,7 @@ candidates) is recorded as a KernelFusion `error` and no fusion profile runs; th
 | `implementable_levels` | `GEAK_KF_IMPLEMENTABLE_LEVELS` | `L1,L2,L3` | fusion levels the analysis may recommend and the architect may route (all levels are still ranked) |
 | `unsupported_patterns` | `GEAK_KF_UNSUPPORTED_PATTERNS` | L3 MegaKernel (e.g. MegaMoE), L4 MonoKernel | patterns inside those levels that are ranked but not recommended or routed |
 | `task` | `GEAK_KF_TASK` | — | operator constraints appended to every KernelFusion prompt (e.g. directories it must not read) |
+| `single_speedup_prior` | `GEAK_KF_SINGLE_SPEEDUP_PRIOR` | `1.2` | (`kf_single_speedup_prior`) the speedup assumed for a single kernel the analysis gave no estimate for: its estimate is the Amdahl ceiling of its GPU-time share at this speedup, so heads and regions are ordered in one unit |
 
 Synthetic speculative acceptance (`SGLANG_SIMULATE_ACC_*`, `TILERT_SIMULATE_ACC_*`,
 `TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS`, as InferenceX AgentX throughput runs set) stays on for

@@ -63,6 +63,13 @@ def test_on_forwards_the_switch_and_the_knobs(tmp_path):
     assert not {"kf_dir", "kf_baseline_dir", "kf_baseline_mode", "kf_reuse", "time_budget_s", "eval_dir"} & set(a)
 
 
+def test_the_single_kernel_speedup_prior_is_forwarded(monkeypatch):
+    assert "kf_single_speedup_prior" not in kfa.workflow_args({"kernel_fusion": True})       # default: the workflow's 1.2
+    assert kfa.workflow_args({"kernel_fusion": {"single_speedup_prior": 1.5}})["kf_single_speedup_prior"] == 1.5
+    monkeypatch.setenv("GEAK_KF_SINGLE_SPEEDUP_PRIOR", "1.3")
+    assert kfa.workflow_args({"kernel_fusion": {"single_speedup_prior": 1.5}})["kf_single_speedup_prior"] == "1.3"
+
+
 def test_several_prompt_files(tmp_path):
     a, b = tmp_path / "prompt.txt", tmp_path / "deploy.txt"
     a.write_text("x"); b.write_text("y")
