@@ -94,6 +94,10 @@ additional draws. Use matching seeds and draw counts on both sides (the shared
 `run_correctness` random gate uses seed 0). Graph replay still needs its normal
 boundary cases and in-place input refresh. A serving-captured `reference_io.pt`
 is optional; generated reference outputs are not captures from the model.
+Exception: an L3 MegaKernel fusion region (`meta.mega: true`, see
+`roles/_fragments/fusion_ut_contract.md`) takes its per-rank `reference_io/rank<r>/`
+from the online server, because a cross-rank seam's inputs (routing, peer buffers,
+metadata) cannot be generated faithfully; it also ships per-rank `weights/`.
 
 Record which inputs are generated and which are structural fixtures. For MoE
 routing, sparse indices, page tables and sequence state, first reuse existing

@@ -33,7 +33,13 @@ collective state.
 ## Rank execution and acceptance
 
 Launch all ranks under one full-set lease using `gpu_lock_set.py`. Use bounded
-process-group initialization and a launcher that terminates failed rank groups.
+process-group initialization and a launcher that terminates failed rank groups:
+GEAK's `e2e_workflow/scripts/mp_harness.py` is that launcher (one process per
+rank, bounded init, seam outputs compared per rank and reduced to the max, each
+case timed as the slowest rank, the unified `CORRECTNESS` / `case` /
+`GEAK_GEOMEAN_SPEEDUP` lines); copy it into the task unchanged and give it the
+task's cases module. An L3 MegaKernel fusion region's UT uses it the same way
+(`roles/_fragments/fusion_ut_contract.md`).
 Collect per-rank results; a successful launcher or rank 0 alone is insufficient.
 Keep numerical inputs distinct across ranks and compare every rank's output
 with an independent sum/reference. Validate eager execution and the deployed

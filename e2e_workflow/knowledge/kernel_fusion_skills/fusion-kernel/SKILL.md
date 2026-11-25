@@ -100,6 +100,27 @@ no Python branch on a GPU value, no allocation inside the captured region; the g
 values only. `init.py` (a `prepare(ctx)`) only when start-up preparation is needed (JIT of every width
 before the KV cache is sized, registrations).
 
+## L3 MegaKernel (multi-rank)
+
+When the lane task says `L3 MEGAKERNEL on N ranks` (the region has `mega: true` and `required_gpu_count: N`):
+
+1. **Read the Mega skill first**: the file the task names (`kf_mega_skill`; by default
+   `../co-optimization/MEGA_SKILL_LINK.md`, a placeholder until the user supplies the Mega skill's address or file:
+   follow the link it gives, if any).
+2. **Then the co-optimization `[multi-rank]` items**: `02` B10 (send once per destination, route counts early),
+   B14 (spread cross-rank traffic over peers, push not pull), C10–C11 (peer stores without per-store drains, data
+   as its own flag); `04` trap 13 (faster kernels expose latent distributed bugs: check cross-rank consistency and
+   run both arms with the same fix); `08` (host checks every rank evaluates the same way, collective setup and
+   close, bounded spins that trap with a record, UT of every output and bad input).
+3. **Run on the group**: the lane holds `gpus_per_job = N` cards per command; the region UT runs every rank
+   through `scripts/mp_harness.py` (`fusion_ut_contract.md`, "L3 MegaKernel") and compares every rank's seam
+   outputs against the per-rank `reference_io/`. Steps 0–7 apply unchanged; the floor of step 0 includes the
+   collectives as served (the production communicator, graph-captured), and the five columns are the slowest
+   rank's times.
+4. **Hand back** `required_gpu_count` in `support.json` (the UT's), and an `init.py` that prepares every rank
+   (symmetric-memory / IPC registration, JIT of every width) before the KV cache is sized. A case with another TP /
+   EP size, or a width the kernel does not cover, goes to `refusals`.
+
 ## The hand-back
 
 Every implementer of a fusion region, a kernel lane or an outside team, hands back the same directory:

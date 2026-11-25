@@ -6,10 +6,11 @@ team) hands back the same directory, and KernelFusion accepts it the same way:
 
     <handback>/
       kernel_src/      the implementation (the only thing that changed against the region UT's task dir)
-      support.json     where it engages: {"phases": [...], "m_range": "...", "dtypes": [...], "refusals": [...]}
+      support.json     where it engages: {"phases": [...], "m_range": "...", "dtypes": [...], "refusals": [...]},
+                       and for a multi-rank UT (meta.mega / meta.required_gpu_count > 1) "required_gpu_count"
       init.py          optional: server start-up preparation (JIT, registrations)
       ut_result.json   the region UT's result on this implementation
-      notes.md         which variant was delivered (stock / tuned member / tuned and fused), per-case times, design
+      notes.md         the verdict (all cases at the floor / some, the rest routed back / not feasible), the design
 
   assemble  builds it from a kernel lane's result: applies the lane's final_patch.diff to a copy of the task
             dir's kernel_src/, moves the files the lane wrote under kernel_src/_handback/ to the top, and
@@ -58,6 +59,15 @@ def _speedup(ut):
     return 0.0
 
 
+def _ranks(d):
+    """The GPUs one run of a multi-rank (L3 MegaKernel) UT or hand-back takes; 1 otherwise."""
+    try:
+        n = int((d or {}).get("required_gpu_count") or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return n if n > 0 else (2 if (d or {}).get("mega") else 1)
+
+
 def assemble(task_dir, final_patch, lane_result, out, region=None):
     problems, warnings = [], []
     src = os.path.join(task_dir, "kernel_src")
@@ -91,7 +101,8 @@ def assemble(task_dir, final_patch, lane_result, out, region=None):
         # kernel_src/ is what the server runs; an outside hand-back without support.json is still rejected.
         _dump(os.path.join(out, "support.json"), {
             "phases": list(region.get("phases") or []) or ["the region UT's cases"],
-            "m_range": region.get("m_range") or "the region UT's cases", "dtypes": [], "refusals": [], "derived": True})
+            "m_range": region.get("m_range") or "the region UT's cases", "dtypes": [], "refusals": [], "derived": True,
+            **({"required_gpu_count": region["required_gpu_count"]} if region.get("required_gpu_count") else {})})
         warnings.append("support.json was not written by the implementer: derived from the region (phases, m_range)")
     if not os.path.exists(os.path.join(out, "ut_result.json")):
         _dump(os.path.join(out, "ut_result.json"), {
@@ -171,6 +182,10 @@ def check(task_dir, handback, run=False, gpu="", timeout=7200):
             problems.append("support.json: refusals must be a list (empty when it engages everywhere)")
         if not (sup.get("m_range") or sup.get("widths")):
             problems.append("support.json: give m_range or widths (where the implementation engages)")
+        need = _ranks(meta)
+        if need > 1 and _ranks(sup) != need:
+            problems.append(f"support.json: required_gpu_count must be {need}, the ranks the multi-rank UT runs "
+                            f"(got {sup.get('required_gpu_count')})")
     notes = os.path.join(handback, "notes.md")
     if not os.path.isfile(notes) or os.path.getsize(notes) == 0:
         problems.append("notes.md is missing or empty")
@@ -212,7 +227,7 @@ def main(argv=None):
     a.add_argument("--final-patch", default="")
     a.add_argument("--lane-result", default="{}", help="the kernel lane's return, as JSON")
     a.add_argument("--out", required=True)
-    a.add_argument("--region", default="", help="the region's facts as JSON (phases, m_range): a lane that wrote "
+    a.add_argument("--region", default="", help="the region's facts as JSON (phases, m_range, required_gpu_count): a lane that wrote "
                    "no support.json gets one derived from them")
     a.add_argument("--check", action="store_true", help="check the assembled hand-back too")
     c = sub.add_parser("check")

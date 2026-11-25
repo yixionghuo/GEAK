@@ -142,7 +142,14 @@ own kernels, every other region a slot of its own, `head_budget` slots. A
 slot's candidates run best estimate first and meet in one A/B against a shared
 reference; a head's failed extract or no-win bake-off does not drop its
 regions, and a region of a slot not run goes to the milestone loop, which is
-ordered by the same estimate. The order is recorded as `schedule`. A banked region is carried like any accepted kernel, and
+ordered by the same estimate. The order is recorded as `schedule`. An L3
+MegaKernel region (`mega: true`) is the analysis' call like any L3 region
+(only L4 is unsupported by default): its region UT runs every rank
+(`e2e_workflow/scripts/mp_harness.py`) on a group of `required_gpu_count`
+GPUs, its lane gets that group with `gpus_per_job`, and it reads
+`kf_mega_skill` first; one needing more GPUs than the run has is recorded in
+`unprepared` as `mega_needs_<N>_gpus`. A recommended region whose level is
+not in `implementable_levels` is dropped. A banked region is carried like any accepted kernel, and
 Finalize ships it. A fusion profile that fails, finds
 nothing or is switched off leaves the run exactly as it is without KF.
 
@@ -159,7 +166,8 @@ CLI flags (`--kernel-fusion` / `--no-kernel-fusion`), the
     "prompt": "/path/deployment_notes.txt",   // run-specific prompt(s), comma-separated
     "implementable_levels": "L1,L2,L3",
     "task": "operator constraints for every KernelFusion agent",
-    "single_speedup_prior": 1.2               // kf_single_speedup_prior: a single kernel's assumed speedup when unestimated
+    "single_speedup_prior": 1.2,              // kf_single_speedup_prior: a single kernel's assumed speedup when unestimated
+    "mega_skill": "/path/or/address"          // kf_mega_skill: how to write an L3 MegaKernel (default: a placeholder link)
   }
 }
 ```
@@ -261,7 +269,7 @@ The workflow writes the following fields to the result file.
     "schedule": [{"slot": "h_gemm", "candidates": [{"short_name": "kf_c4", "kind": "fusion", "est_gain_pct": 3, "basis": "..."}]}],
     "handbacks": [{"short_name": "kf_c2", "handback": ".../kernel_fusion/handback/kf_c2", "ok": true, "warnings": []}],
     "routed": ["kf_c2"],                 // regions the architect sent to the kernel track
-    "unprepared": [ /* AgentX: recommended regions without a passing region UT, with the reason */ ],
+    "unprepared": [ /* recommended regions without a region UT, with the reason (e.g. "mega_needs_8_gpus") */ ],
     "accepted": [{"short_name": "kf_c2", "fusion_id": "c2", "isolated_speedup": 1.3, "e2e_delta_pct": 1.8}],
     "outcomes": [{"short_name": "kf_c2", "verdict": "confirmed", "e2e_delta_pct": 1.8}],
     "soft_parity": true                  // a region is banked: later A/Bs and Validate carry the accuracy gate

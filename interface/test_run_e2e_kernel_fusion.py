@@ -70,6 +70,21 @@ def test_the_single_kernel_speedup_prior_is_forwarded(monkeypatch):
     assert kfa.workflow_args({"kernel_fusion": {"single_speedup_prior": 1.5}})["kf_single_speedup_prior"] == "1.3"
 
 
+def test_the_mega_skill_link_and_mega_fields_are_forwarded(tmp_path, monkeypatch):
+    assert "kf_mega_skill" not in kfa.workflow_args({"kernel_fusion": True})                 # default: the placeholder
+    assert (kfa.GEAK_ROOT / "e2e_workflow/knowledge/kernel_fusion_skills/co-optimization/MEGA_SKILL_LINK.md").is_file()
+    f = tmp_path / "mega.md"
+    f.write_text("x")
+    assert kfa.workflow_args({"kernel_fusion": {"mega_skill": str(f)}})["kf_mega_skill"] == str(f.resolve())
+    monkeypatch.setenv("GEAK_KF_MEGA_SKILL", "https://example.invalid/mega-skill")
+    assert kfa.workflow_args({"kernel_fusion": True})["kf_mega_skill"] == "https://example.invalid/mega-skill"
+    t = tmp_path / "topk.json"
+    t.write_text(json.dumps({"candidates": [{"id": "m", "level": "L3", "mega": True, "required_gpu_count": 4,
+                                             "comm": ["dispatch", "combine"]}], "recommended": ["m"]}))
+    c = kfa.build_args({"topk_json": str(t)})["kf_topk"]["candidates"][0]
+    assert (c["mega"], c["required_gpu_count"], c["comm"]) == (True, 4, ["dispatch", "combine"])
+
+
 def test_several_prompt_files(tmp_path):
     a, b = tmp_path / "prompt.txt", tmp_path / "deploy.txt"
     a.write_text("x"); b.write_text("y")

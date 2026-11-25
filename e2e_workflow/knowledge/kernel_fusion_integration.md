@@ -20,6 +20,13 @@ switch), it is not a phase of its own: it is broken down into the stages GEAK al
   A/B with the region's UT). The order and estimates are `kernel_fusion.schedule`. The Milestone queue is
   ordered by the same estimate. Without a fusion profile (switched off, failed, empty) HeadKernel and the
   Milestone order are exactly GEAK's own.
+- **L3 MegaKernel** regions (`mega: true`, `required_gpu_count` N, `comm`) are recommended by the analysis like
+  any L3 region (only L4 is unsupported by default); the code drops a recommended region whose level is not in
+  `kf_implementable_levels`. A MegaKernel's UT is prepared on a leased group of N cards (`GPU_GROUP`, via the
+  workflow's `makeSem`) and follows the L3 MegaKernel part of `fusion_ut_contract.md` (per-rank `weights/` and
+  online `reference_io/`, multi-rank controls, `scripts/mp_harness.py`); its lane, in a HeadKernel slot or the
+  Milestone loop, gets `gpu_ids` = the group and `gpus_per_job` = N, and reads `kf_mega_skill` first. A
+  MegaKernel needing more GPUs than the run has is `unprepared` with reason `mega_needs_<N>_gpus`.
 - **The Milestone loop** builds, optimizes and measures every other routed region like any kernel
   candidate: a region UT (extract), a fused kernel (`kernel_lane.js`), then the integrate A/B on the
   overlay accepted so far. An accepted region's overlay is checked on disk before it is banked, in either
@@ -60,8 +67,9 @@ Every region, at any level and whoever implements it, uses one UT standard and o
   rejected hand-back never reaches the A/B). `fusion_handback.py check --run` re-runs the UT on a hand-back
   from outside GEAK.
 
-Levels L1–L3 are implemented (`kf_implementable_levels`). L3 MegaKernel and L4 MonoKernel are ranked by the
-analysis but not prepared or routed (`kf_unsupported_patterns`); they wait for the MonoKernel interface.
+Levels L1–L3 are implemented (`kf_implementable_levels`), L3 MegaKernel included (multi-rank, on a GPU group).
+L4 MonoKernel is ranked by the analysis but not prepared or routed (`kf_unsupported_patterns`); it waits for the
+MonoKernel interface.
 
 Switched off, nothing changes: no prompt, lane, log line or result field carries any trace of it.
 
@@ -85,6 +93,7 @@ e2e_workflow/knowledge/kernel_fusion_skills/co-optimization/
 e2e_workflow/knowledge/kernel_fusion_skills/fusion-kernel/
                                                 the fusion-kernel skill (SKILL.md, references/:
                                                 FlyDSL), read by the kernel_lane.js run that writes the fused kernel
+e2e_workflow/scripts/mp_harness.py              the multi-rank harness an L3 MegaKernel region UT runs every rank through (CPU self-test: tests/test_mp_harness.py)
 e2e_workflow/scripts/fusion_handback.py        assembles a region lane's hand-back and checks it against the region UT (run through one agent)
 e2e_workflow/scripts/fusion_overlay_check.py    the on-disk check of an accepted region's overlay (run through one agent)
 interface/kernel_fusion_args.py                 the switch and knobs -> workflow args; the only KernelFusion code run_e2e.py calls
@@ -171,8 +180,9 @@ candidates) is recorded as a KernelFusion `error` and no fusion profile runs; th
 | `topk_json` | `GEAK_KF_TOPK_JSON` | — | a finished `topk.json`; the analysis is not re-run |
 | `source_dirs` | `GEAK_KF_SOURCE_DIRS` | installed packages | framework/op-library source for the analyst when it is not importable where the run is |
 | `implementable_levels` | `GEAK_KF_IMPLEMENTABLE_LEVELS` | `L1,L2,L3` | fusion levels the analysis may recommend and the architect may route (all levels are still ranked) |
-| `unsupported_patterns` | `GEAK_KF_UNSUPPORTED_PATTERNS` | L3 MegaKernel (e.g. MegaMoE), L4 MonoKernel | patterns inside those levels that are ranked but not recommended or routed |
+| `unsupported_patterns` | `GEAK_KF_UNSUPPORTED_PATTERNS` | L4 MonoKernel | patterns inside those levels that are ranked but not recommended or routed (an L3 MegaKernel is the analyst's call) |
 | `task` | `GEAK_KF_TASK` | — | operator constraints appended to every KernelFusion prompt (e.g. directories it must not read) |
+| `mega_skill` | `GEAK_KF_MEGA_SKILL` | `knowledge/kernel_fusion_skills/co-optimization/MEGA_SKILL_LINK.md` | (`kf_mega_skill`) the skill a lane reads first to write an L3 MegaKernel: a file (resolved) or an address; the default is a placeholder until the Mega skill is supplied |
 | `single_speedup_prior` | `GEAK_KF_SINGLE_SPEEDUP_PRIOR` | `1.2` | (`kf_single_speedup_prior`) the speedup assumed for a single kernel the analysis gave no estimate for: its estimate is the Amdahl ceiling of its GPU-time share at this speedup, so heads and regions are ordered in one unit |
 
 Synthetic speculative acceptance (`SGLANG_SIMULATE_ACC_*`, `TILERT_SIMULATE_ACC_*`,
