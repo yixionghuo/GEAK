@@ -71,8 +71,39 @@ The workflow decides the winner by measurement. This skill is a prior, not a man
 | Shared helpers (buffer ops, DPP, layouts) | `kernels/common/` |
 | Teaching examples | `examples/01-vectorAdd.py`, `02-tiledCopy.py`, `03-tiledMma.py` |
 
-GEAK's own FlyDSL cards: `perf_knowledge/operators/*/backends/flydsl.md` (rmsnorm, gemm_epilogue_fused,
-grouped_gemm_moe, layout_shuffle, mla_attention).
+## 4b. GEAK's own FlyDSL knowledge
+
+The files above are upstream reference *code*. GEAK carries measured knowledge about the same kernels,
+and for a GEMM-shaped region it is the better starting point, because it says which knobs are real and
+which directions have already been measured shut. Paths are from the repo root.
+
+| Need | Read |
+|---|---|
+| What FlyDSL is, what it can express, where it beats Triton | `perf_knowledge/languages/flydsl/overview.md` |
+| The knob list with legal ranges, and the arch limits behind them | `perf_knowledge/languages/flydsl/knobs.md` |
+| Skeletons per kernel class, and the idioms that survive compilation | `perf_knowledge/languages/flydsl/patterns.md`, `kernel_families.md` |
+| Lowering, layout algebra, scheduling — when a knob does not behave | `perf_knowledge/languages/flydsl/deep.md` |
+| **Which GEMM levers exist and in what order to spend them** | `perf_knowledge/languages/flydsl/authoring_gemm_levers.md` |
+| Which call forms moved or vanished between FlyDSL versions | `perf_knowledge/languages/flydsl/overview.md` §On-box |
+
+Per-operator SOTA cards, `perf_knowledge/operators/<op>/backends/flydsl.md`, exist for: `dense_gemm`,
+`grouped_gemm_moe`, `fused_moe_grouped_gemm`, `gemm_epilogue_fused`, `scaled_quant_gemm`,
+`splitk_streamk_gemm`, `skinny_gemv_decode`, `layout_shuffle`, `mla_attention`, `rmsnorm`, `layernorm`,
+`softmax`, `reduction`, `act_and_mul_silu_gelu`, `linear_attention_gated_delta`.
+
+**Dense GEMM, specifically.** `perf_knowledge/operators/dense_gemm/backends/flydsl.md` is the card to
+open before tuning a GEMM member of a fusion region. Two things in it change what you try:
+
+- The knob space is a **registry of built variants, not a product of ranges.** `block_m_warps` /
+  `block_n_warps` / `b_to_lds` take exactly five combinations; `c_to_lds` is fixed False; `stages` is
+  fixed 2; `async_copy` is derived from the arch; `split_k` is restricted to K divisors that leave a
+  `tile_k`-divisible split. Sweeping outside that set does not produce a slow kernel, it produces no
+  kernel — and a tuner that "found nothing" usually asked for one.
+- Deploy is through aiter's tuned-CSV dispatcher (`libtype=flydsl`), not a direct call. A fused kernel
+  that replaces a dense GEMM has to beat the *tuned* row, not the default one.
+
+Each claim in that card names its own source lines; the card is the evidence layer, so read it
+rather than re-deriving the knob space from the upstream kernels.
 
 ## 5. Kernel fusion with FlyDSL
 
@@ -97,6 +128,12 @@ Rules and patterns are in `fusion-recipes.md`. In short:
 
 Knobs, limits and the profiling loop are in `tuning.md`. Checklist targets for a GEMM hot
 loop: MFMA ≥ 40% of the loop, combined VGPRs ≤ 256, no spills, LDS conflicts removed by swizzle.
+
+For a GEMM the order to spend levers in is already written down — read
+`perf_knowledge/languages/flydsl/authoring_gemm_levers.md` before picking a knob, and
+`perf_knowledge/operators/dense_gemm/backends/flydsl.md` §knobs for which values are actually built
+(§4b). Tuning a shipped kernel and authoring a new one are different jobs with different legal sets;
+the card says which one you are in.
 
 ## 7. Debugging
 
