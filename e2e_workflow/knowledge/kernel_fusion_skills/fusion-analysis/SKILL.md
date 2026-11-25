@@ -171,19 +171,39 @@ applies, and state why.
 
 A region's kernels can also be optimized one by one, without fusion: tune or replace the heaviest member,
 leave the rest. For every candidate, estimate that single-kernel route on the same kernels and the same
-weights, and keep the fusion only when it is expected to win:
+weights, and keep the fusion only when it is expected to win. The method is the co-optimization skill's
+(`../co-optimization/fusion_kernel_prompt.md` steps 1–2, `../co-optimization/references/01_decide_and_order.md`
+§1–§3, `07_kernel_to_e2e.md` §1–§3); read those sections before estimating.
 
 - **Single-kernel gain:** the heaviest member's weighted time × (1 − 1 / its plausible speedup alone),
   plus the same for any other member worth optimizing. Take the plausible speedup from the member's kind
   and the evidence: a library kernel already tuned for these shapes has little left; a generic or
   untuned path at small M often has much more. Say where the number comes from.
-- **Fusion gain:** the candidate's expected gain (Estimation). A fused kernel is built on the tuned member
-  (tune first, then fuse), so the fusion gain includes the member's own gain only when the fused design
-  keeps the tuned member's implementation.
+- **Floor first:** `t_floor = min(the chain as served, the members optimized alone)`. A fused kernel only
+  counts for what it gains below `t_floor`, not below the stock chain; the single-kernel gain is that floor's.
+- **Fusion gain upper bound:** (graph nodes removed) × ~2 µs + intermediate bytes ÷ 7 TB/s per occurrence,
+  × occurrences, × the phase weight. Inside a captured graph a removed launch is ~2 µs, not the launch
+  latency a profiler shows. The expected value discounts it by the per-edge analysis below.
+- **Per edge** of the region: classify the dependency D0 local, D1 recomputable, D2 small-group reduction,
+  D3 global reduction, D4 broadcast/reuse (prompt step 2), and check the three conditions of `01` §2. A D3 or
+  D4 edge counts only if a rewrite removes it (another algorithm, fewer splits, last-arriver, algebraic split,
+  moving the boundary); name the rewrite. None found: the region is not fused across that edge (split the
+  region there, or route it `single_kernel`).
+- **Launch-only regions:** when the only gain is fewer launches (no HBM round trip, no on-chip handover, no
+  overlap, no prefetch under a wait), the route is `single_kernel`.
+- **Coverage:** weight both gains by the share of GPU time the region covers in each phase and the batch /
+  width distribution of the served recipe (`07` §3): a kernel speedup on a bucket the recipe rarely runs is
+  worth that share, not the speedup.
 - **Route:** `fusion` when the fusion gain is larger, `single_kernel` otherwise. A region whose time is
   mostly one member and whose neighbours are a small share of it is usually `single_kernel`.
 
-Record both numbers and the route for every candidate, and the reason in one line.
+Record both numbers, the route and one line of basis (`gain_basis`: the nodes, bytes, edge classes and
+coverage the numbers come from) for every candidate.
+
+**Every single-kernel hotspot too.** For each kernel in the TopK hotspots (the Top-N the run profiled,
+whether or not it is in a region), estimate its single-kernel gain the same way (weighted time × (1 −
+1 / plausible speedup), with the basis). The workflow orders the heads and regions of one queue by these
+numbers and the regions' `est_gain_pct_expected`, so both must be in the same unit: e2e % of the target metric.
 
 ### Step 6 — Ranking and recommendation
 
@@ -200,24 +220,30 @@ Deliver:
 
 ## Estimation
 
-Gain and cost are estimated at the shapes actually served.
+Gain and cost are estimated at the shapes actually served, by the co-optimization method
+(`../co-optimization/SKILL.md` §0.1 items 1–4; `01` §1–§3; `07` §1–§3).
 
-- **Gain** comes from fewer launches and fewer HBM round trips. Graph replay removes only the CPU-side
-  launch cost; each kernel's fixed GPU-side cost and the memory round trip between kernels remain, so
-  reducing the kernel count also pays inside graph-replayed regions.
-- **Cost** comes from lost parallelism (for example split-K or split-KV), replacing heavy kernels
-  (GEMMs, library operators) and cross-module integration.
-- **Quantify from the trace:** measured duration of the kernels the fusion removes (including each
-  kernel's fixed cost) × occurrences per step × the phase weight. Per-layer paths multiply by the layer
-  count and usually carry the largest gains; find all of them and rank them first.
-- Convert to a share of total device time using the workload-summary weights. Report an upper bound and
-  an expected value, and state the reason for the discount between them.
+- **Fusion removes waiting, never work.** Gain comes from the HBM round trips of intermediates, the waits
+  and joins between kernels, and the overlap or prefetch a single kernel makes expressible. Inside a captured
+  graph kernels run back to back: one removed graph node is ~2 µs, and removing launches alone has measured
+  ~0 (`01` §3 rung 4). Do not price fusion by launch count.
+- **Upper bound** per occurrence = (nodes removed) × ~2 µs + intermediate bytes no longer written and read ÷
+  7 TB/s (MI355X streaming read; re-measure elsewhere). Multiply by occurrences per step (per-layer paths × the
+  layer count, which usually carry the largest gains; find all of them) and the phase weight.
+- **Expected value** = the upper bound below `t_floor`, after the per-edge classes (Step 5): D3/D4 edges without a
+  rewrite contribute nothing; the first fused skeleton is usually slower than the chain (0.32×–1.05× measured),
+  so a region whose stages are already at the hardware floor gains only its fixed costs.
+- **Cost** comes from lost parallelism (split-K, split-KV), replacing tuned heavy kernels (GEMMs, library
+  operators: a rewrite in another DSL loses 5–10%), sync and recompute, and cross-module integration.
+- **Coverage:** convert to a share of total device time with the workload-summary weights, per bucket of the
+  served batch / width distribution. Report an upper bound and an expected value, and the reason for the
+  discount between them (`gain_basis`).
 
 As a summary of the trade-off:
 
 ```
-net gain = launch saved + sync saved + HBM traffic saved + overlap gain + locality gain
-         − resource cost − occupancy loss − tile compromise − load imbalance
+net gain = waits/joins removed + HBM traffic saved + overlap/prefetch gain + locality gain
+         − resource cost − occupancy loss − tile compromise − load imbalance − lost parallelism
 ```
 
 Prefer the pattern with the largest expected net gain.

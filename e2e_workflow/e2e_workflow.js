@@ -3589,7 +3589,9 @@ const KF_TASK = String(A.kf_task || '');   // operator constraints, binding on e
 // A finished analysis (run_e2e.py reads kf_topk_json into it): reused, not re-run.
 const KF_TOPK = A.kf_topk && typeof A.kf_topk === 'object' && Array.isArray(A.kf_topk.candidates) ? A.kf_topk : null;
 const KF_UT_CONTRACT = `${WORKFLOW_DIR}/roles/_fragments/fusion_ut_contract.md`;
-// The fused kernel a kernel lane writes for a region: the fusion-kernel skill (tune the heavy member, then fuse).
+// The fused kernel a kernel lane writes for a region: the co-optimization method (its prompt steps 0-7, then
+// its SKILL.md), mapped onto the region UT and its hand-back by the fusion-kernel skill.
+const KF_COOPT_DIR = `${WORKFLOW_DIR}/knowledge/kernel_fusion_skills/co-optimization`;
 const KF_KERNEL_SKILL = `${WORKFLOW_DIR}/knowledge/kernel_fusion_skills/fusion-kernel/SKILL.md`;
 
 const KF_CANDIDATE_SCHEMA = obj({
@@ -3603,6 +3605,9 @@ const KF_OPPORTUNITY_SCHEMA = obj({
   topk_json: { type: 'string' }, report_path: { type: 'string' }, digest_md: { type: 'string' },
   candidates: { type: 'array', items: KF_CANDIDATE_SCHEMA }, recommended: arrStr, notes: { type: 'string' },
   report_md: { type: 'string' }, model_notes_md: { type: 'string' },
+  // Every TopK single-kernel hotspot's expected gain alone, in the regions' unit (e2e %): HeadKernel orders by it.
+  hotspots: { type: 'array', items: obj({ kernel: { type: 'string' }, pct_gpu_time: { type: 'number' },
+    single_kernel_gain_pct_expected: { type: 'number' }, basis: { type: 'string' } }, ['kernel']) },
 }, ['topk_json', 'candidates', 'recommended', 'report_md']);
 const KF_OVERLAY_CHECK_SCHEMA = obj({ ok: { type: 'boolean' }, problems: arrStr, manifest_sha256: { type: 'string' },
   files: { type: 'number' } }, ['ok']);
@@ -3610,7 +3615,7 @@ const KF_OVERLAY_CHECK_SCHEMA = obj({ ok: { type: 'boolean' }, problems: arrStr,
 const KF_CAND_KEYS = ['id', 'rank', 'level', 'region', 'kernels', 'phases', 'occurrences', 'm_range', 'seam',
   'inputs_outputs', 'launches_before', 'launches_after', 'region_pct_device_time', 'est_gain_pct_expected',
   'difficulty', 'bitwise_exact', 'exclusive_with', 'language', 'fallback', 'fused_design',
-  'single_kernel_gain_pct_expected', 'route'];
+  'single_kernel_gain_pct_expected', 'route', 'gain_basis'];
 const KF_ROUTE_KEYS = ['id', 'rank', 'level', 'region', 'kernels', 'phases', 'm_range', 'seam',
   'region_pct_device_time', 'est_gain_pct_expected', 'single_kernel_gain_pct_expected', 'route', 'difficulty',
   'bitwise_exact', 'exclusive_with', 'fallback'];
@@ -3674,7 +3679,7 @@ async function kfProfile(phaseName) {
   kfRecord.trace_dir = traceDir || kxDir;
   try {
     let res = KF_TOPK ? { topk_json: String(A.kf_topk_json || ''), candidates: KF_TOPK.candidates,
-      recommended: KF_TOPK.recommended || [] } : null;
+      recommended: KF_TOPK.recommended || [], hotspots: KF_TOPK.hotspots } : null;
     if (!res) {
       if (!kfRecord.trace_dir) throw new Error('no trace: this run has no profile trace to analyze; pass kf_trace_dir');
       res = await safeAgent(roleAgent('fusion_analyst', 'analyze', kfIntro('Rank the fusion opportunities in this run\'s trace.'), {
@@ -3700,7 +3705,9 @@ async function kfProfile(phaseName) {
     kfAdopt(Object.assign(kfRecord, { status: 'profiled', topk_json: res.topk_json || '',
       report_path: KF_TOPK ? '' : (res.report_path || `${out}/REPORT.md`),
       candidates, recommended: recommended.filter((id) => !singleRoute.has(id)),
-      single_kernel_route: [...singleRoute] }));
+      single_kernel_route: [...singleRoute],
+      hotspots: (Array.isArray(res.hotspots) ? res.hotspots : []).filter((h) => h && h.kernel).map((h) => kfPick(h,
+        ['kernel', 'pct_gpu_time', 'single_kernel_gain_pct_expected', 'basis'])) }));
     log(`[kf] fusion profile: ${candidates.length} candidates, recommended ${JSON.stringify(kfRecord.recommended)}` +
       (singleRoute.size ? `; single-kernel route ${JSON.stringify([...singleRoute])}` : ''));
   } catch (e) {
@@ -3834,9 +3841,12 @@ function kfLaneTask(c) {
   const region = { region: r.region || '', kernels_in_order: r.kernels || [], phases: r.phases || [],
     m_range: r.m_range || '', seam: r.seam || {}, inputs_outputs: r.inputs_outputs || '',
     launches_before: r.launches_before || (r.kernels || []).length, launches_after: r.launches_after || 1,
-    suggested_design: r.fused_design || '', bitwise_exact_expected: !!r.bitwise_exact };
+    suggested_design: r.fused_design || '', bitwise_exact_expected: !!r.bitwise_exact,
+    ...kfPick(r, ['est_gain_pct_expected', 'single_kernel_gain_pct_expected', 'gain_basis']) };
   return `FUSION REGION ${r.id} (${r.level || '?'}): write ONE fused ${lang} kernel that replaces this whole ` +
-    `kernel region of a live LLM serving stack. Read ${KF_KERNEL_SKILL} and the references it links first. The region: ` +
+    `kernel region of a live LLM serving stack. Read first, in this order: ${KF_COOPT_DIR}/fusion_kernel_prompt.md ` +
+    `(the method, steps 0-7), ${KF_COOPT_DIR}/SKILL.md (§0.1, §0.2), then ${KF_KERNEL_SKILL} (the task dir and ` +
+    'hand-back) and the references they link. The region: ' +
     JSON.stringify(region) + '. ' + GRAPH_REQ + (TASK || '') + (KF_TASK ? ` OPERATOR CONSTRAINTS: ${KF_TASK}` : '');
 }
 // The integrate A/B of a region: its facts in KERNEL_RESULT and the accuracy gate, both in the inputs, so

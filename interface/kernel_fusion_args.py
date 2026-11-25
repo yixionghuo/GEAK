@@ -83,14 +83,20 @@ CAND_KEYS = ("id", "rank", "level", "region", "kernels", "phases", "occurrences"
              "launches_before", "launches_after", "region_pct_device_time", "est_gain_pct_expected", "difficulty",
              "bitwise_exact", "exclusive_with", "language", "fallback", "fused_design",
              # the route against optimizing the region's kernels one by one: "single_kernel" is never prepared or routed
-             "single_kernel_gain_pct_expected", "route")
+             "single_kernel_gain_pct_expected", "route", "gain_basis")
+# every TopK single-kernel hotspot's expected gain alone: HeadKernel orders heads and regions by it
+HOTSPOT_KEYS = ("kernel", "pct_gpu_time", "single_kernel_gain_pct_expected", "basis")
 
 
 def slim_topk(d: dict) -> dict:
-    """Every candidate (the System Architect judges them all), each with only CAND_KEYS."""
+    """Every candidate (the System Architect judges them all), each with only CAND_KEYS, and every hotspot."""
     cands = {str(c.get("id")): c for c in d.get("candidates") or [] if isinstance(c, dict)}
-    return {"candidates": [{k: c[k] for k in CAND_KEYS if k in c} for c in cands.values()],
-            "recommended": [str(i) for i in d.get("recommended") or []]}
+    out = {"candidates": [{k: c[k] for k in CAND_KEYS if k in c} for c in cands.values()],
+           "recommended": [str(i) for i in d.get("recommended") or []]}
+    hot = [{k: h[k] for k in HOTSPOT_KEYS if k in h} for h in d.get("hotspots") or [] if isinstance(h, dict) and h.get("kernel")]
+    if hot:
+        out["hotspots"] = hot
+    return out
 
 
 def _read_json(p: Path) -> dict | None:

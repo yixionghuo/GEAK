@@ -123,12 +123,16 @@ AgentX, after the baseline kernel-extract preparation), the `fusion-analysis`
 skill reads the same trace and writes a fusion profile: which kernels run back
 to back as one region, and the one Python seam that launches each. It also
 compares each region with optimizing its kernels one by one and recommends only
-the regions where fusion is expected to win. Strategize
+the regions where fusion is expected to win, estimating both gains by the
+`co-optimization` skill's method (nodes removed x ~2 us + intermediate bytes /
+7 TB/s, per-edge D0-D4, covered share), and gives every TopK single-kernel
+hotspot its own expected gain (`hotspots`). Strategize
 and every milestone plan route the regions worth a fused kernel as kernel
 candidates that name a `fusion_id`, and the milestone loop treats each one like
 any kernel candidate: a region unit test, one fused kernel from the kernel
-workflow (`kernel_lane.js`, following the `fusion-kernel` skill: tune the heavy
-member, then fuse), and the run's own integrate A/B on the overlay
+workflow (`kernel_lane.js`, following the `co-optimization` skill's fusion
+kernel prompt and the `fusion-kernel` skill: parity floor first, done when the
+fused kernel is no slower than that floor on every case), and the run's own integrate A/B on the overlay
 accepted so far (gsm8k accuracy gate, then throughput), finished at the
 Finalize-gate when it is still pending. A region on a head's own kernel is
 built the same way in HeadKernel instead, as one more candidate in that head's
@@ -248,6 +252,7 @@ The workflow writes the following fields to the result file.
     "candidates": [ /* the fusion profile's regions */ ],
     "recommended": ["c2", "c1"],
     "single_kernel_route": ["c5"],       // regions the analysis left to single-kernel work (never routed)
+    "hotspots": [{"kernel": "gemm_kernel", "pct_gpu_time": 12, "single_kernel_gain_pct_expected": 1.2, "basis": "..."}],
     "handbacks": [{"short_name": "kf_c2", "handback": ".../kernel_fusion/handback/kf_c2", "ok": true, "warnings": []}],
     "routed": ["kf_c2"],                 // regions the architect sent to the kernel track
     "unprepared": [ /* AgentX: recommended regions without a passing region UT, with the reason */ ],

@@ -114,6 +114,20 @@ def test_a_given_topk_keeps_each_region_route(tmp_path):
     assert (c["route"], c["single_kernel_gain_pct_expected"]) == ("single_kernel", 3.5)
 
 
+def test_a_given_topk_keeps_gain_basis_and_every_hotspot(tmp_path):
+    t = tmp_path / "topk.json"
+    hot = [{"kernel": f"k{i}", "pct_gpu_time": 10 - i, "single_kernel_gain_pct_expected": 1.0 + i, "basis": "b",
+            "evidence": "x" * 100} for i in range(8)]
+    t.write_text(json.dumps({"candidates": [{"id": "a", "gain_basis": "2 nodes x 2us"}], "recommended": ["a"],
+                             "hotspots": hot + ["junk", {"pct_gpu_time": 1}]}))
+    k = kfa.build_args({"topk_json": str(t)})["kf_topk"]
+    assert k["candidates"][0]["gain_basis"] == "2 nodes x 2us"
+    assert [h["kernel"] for h in k["hotspots"]] == [f"k{i}" for i in range(8)]                   # none is cut
+    assert k["hotspots"][3] == {"kernel": "k3", "pct_gpu_time": 7, "single_kernel_gain_pct_expected": 4.0, "basis": "b"}
+    t.write_text(json.dumps({"candidates": [{"id": "a"}], "recommended": []}))
+    assert "hotspots" not in kfa.build_args({"topk_json": str(t)})["kf_topk"]                   # absent stays absent
+
+
 def test_the_fusion_strategy_is_read_first_and_can_be_replaced_or_dropped(tmp_path):
     deploy = tmp_path / "deploy.txt"
     deploy.write_text("x")

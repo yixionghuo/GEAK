@@ -46,6 +46,16 @@ the setting they were written in; those are NOT this environment. Map them onto 
 Where the prompt says not to write kernels, that is right for you too: the kernel track authors the
 candidates the architect routes with the GEAK kernel layer and A/B-tests them on the live server.
 
+### Gain estimates follow the co-optimization skill
+Every gain you report (`est_gain_pct_upper`, `est_gain_pct_expected`, `single_kernel_gain_pct_expected`, the
+hotspots') is estimated by the method of `$KF_SKILL_DIR/../co-optimization/` (read `fusion_kernel_prompt.md`
+steps 1–2, `references/01_decide_and_order.md` §1–§3 and `references/07_kernel_to_e2e.md` §1–§3): upper bound =
+graph nodes removed × ~2 µs + intermediate bytes ÷ 7 TB/s, per occurrence, × occurrences × phase weight; estimate
+`t_floor` (the chain or its members optimized alone) first; classify every edge D0–D4, and count a D3/D4 edge only
+with a rewrite you name (none: no fusion across it); a region whose only gain is fewer launches is
+`route: "single_kernel"`; weight by the covered share of the served batch / width distribution. All gains are
+weighted e2e % of the target metric, the one unit the workflow orders heads and regions by.
+
 ### The trace is the one this run already took
 Do not capture a new trace. `TRACE_DIR` holds the raw torch traces of this run's Profile round (beside
 `PROFILE_TOPN`), or the traces the operator passed. On an AgentX trace replay the traces are the
@@ -79,7 +89,7 @@ Write the full report the prompt asks for to `KF_OUT/REPORT.md` and the model / 
 Bash), and return the same markdown in `report_md` and `model_notes_md`.
 
 ### Machine-readable result (in addition to everything the prompt asks for)
-Write `KF_OUT/topk.json`: `{"candidates": [...], "recommended": [ids in the order to implement]}`, every
+Write `KF_OUT/topk.json`: `{"candidates": [...], "recommended": [ids in the order to implement], "hotspots": [...]}`, every
 candidate:
 ```
   id (short, [A-Za-z0-9_]), rank, level ("L1".."L4"), region (one line), kernels (device kernel names, in order),
@@ -96,8 +106,15 @@ candidate:
   single_kernel_gain_pct_expected (weighted e2e % expected from optimizing the region's kernels one by one
         instead -- tuning or replacing its heaviest member, no fusion -- estimated as the skill's
         "Fusion against the single-kernel route" says),
-  route ("fusion" when est_gain_pct_expected is larger than single_kernel_gain_pct_expected, else "single_kernel").
+  route ("fusion" when est_gain_pct_expected is larger than single_kernel_gain_pct_expected, else "single_kernel";
+        "single_kernel" also for a region whose only gain is fewer launches),
+  gain_basis (one line: the nodes removed, intermediate bytes, t_floor, edge classes D0-D4 and rewrites, and the
+        covered share the two gains come from).
 ```
+Also write a top-level `"hotspots"` list in topk.json: one entry for EVERY single-kernel hotspot of the TopK
+(`PROFILE_TOPN`, or the kernel ranking of this run's preparation; every kernel listed there, in a region or not),
+`{"kernel": "<device kernel name as in the trace>", "pct_gpu_time": <weighted %>, "single_kernel_gain_pct_expected":
+<weighted e2e % from optimizing that kernel alone>, "basis": "<one line: where the plausible speedup comes from>"}`.
 "recommended" = a list of candidate ids (not a per-candidate flag): the non-conflicting set the prompt's
 ranking recommends, best first, within the fusion levels `IMPLEMENTABLE_LEVELS` and outside
 `UNSUPPORTED_PATTERNS` (all levels are still ranked). A candidate whose region cannot be reached through
@@ -109,5 +126,5 @@ it from `recommended` if it is there).
 ```json
 {"topk_json": "<KF_OUT>/topk.json", "report_path": "<KF_OUT>/REPORT.md", "report_md": "<full report>",
  "model_notes_md": "<model notes>", "digest_md": "<KF_OUT>/digest/digest.md", "candidates": <topk.json candidates>,
- "recommended": <ids>, "notes": "..."}
+ "recommended": <ids>, "hotspots": <topk.json hotspots>, "notes": "..."}
 ```
