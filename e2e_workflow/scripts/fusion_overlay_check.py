@@ -48,6 +48,36 @@ def _read_json(p: Path) -> dict | None:
         return None
 
 
+# The overlay's merged injection manifest (read by sitecustomize.py). Stacking a region on an accepted
+# overlay must ADD its own module/rebind/marker/capture entries here, so this file can never stay
+# byte-identical; it is checked as a superset instead.
+_MANIFEST = "_overlay_manifest.json"
+_MANIFEST_LISTS = ("modules", "rebinds", "markers", "captures")
+
+
+def _manifest_superset_problems(new_p: Path, old_p: Path, root: Path) -> list[str]:
+    """Problems if the new manifest drops or alters any entry of the initial one ([] = superset)."""
+    old, new = _read_json(old_p), _read_json(new_p)
+    if old is None:
+        return [f"initial {_MANIFEST} ({root}) is not a JSON object"]
+    if new is None:
+        return [f"{_MANIFEST} is not a JSON object"]
+    out: list[str] = []
+    for key, val in old.items():
+        if key in _MANIFEST_LISTS:
+            have = new.get(key)
+            if not isinstance(val, list) or not isinstance(have, list):
+                out.append(f"{_MANIFEST}: '{key}' is not a list")
+                continue
+            missing = [e for e in val if e not in have]
+            if missing:
+                out.append(f"{_MANIFEST}: initial '{key}' entries dropped or altered ({root}): "
+                           f"{json.dumps(missing)[:200]}")
+        elif new.get(key) != val:
+            out.append(f"{_MANIFEST}: initial field '{key}' ({root}) was changed")
+    return out
+
+
 def _overlay_files(root: Path) -> dict[str, Path]:
     out: dict[str, Path] = {}
     for dirpath, dirnames, filenames in os.walk(root):
@@ -116,6 +146,8 @@ def validate_overlay(kf_overlay: str, initial_overlay: str, run_dir: Path) -> di
                                     "but the new sitecustomize.py does not import it")
             elif rel not in files:
                 problems.append(f"initial overlay file {rel} ({root}) is missing")
+            elif rel == _MANIFEST:
+                problems.extend(_manifest_superset_problems(files[rel], p, root))
             elif files[rel].read_bytes() != want:
                 problems.append(f"initial overlay file {rel} ({root}) was changed")
     rec, rec_path = _ab_record(overlay, run_dir)

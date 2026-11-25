@@ -158,3 +158,51 @@ def test_the_script_runs_as_the_agent_runs_it(tmp_path):
     p = subprocess.run([sys.executable, str(SCRIPT), "--overlay", ov, "--initial", init, "--root", str(run_dir)],
                        capture_output=True, text=True, timeout=60, check=False)
     assert p.returncode == 0 and json.loads(p.stdout)["ok"], p.stderr
+
+
+def test_validate_overlay_checks_the_merged_injection_manifest_as_a_superset(tmp_path):
+    """The integrator's overlays share ONE sitecustomize.py that reads _overlay_manifest.json. Stacking a
+    region on an accepted overlay must ADD its module to that manifest, so the manifest can never stay
+    byte-identical: it is checked as a superset (DSv4.1-Flash TP2 c32: kf_hc_boundary_norm_sinkhorn on the
+    accepted wo_a overlay was rejected by the old byte-identity rule although nothing of wo_a changed)."""
+    site = "import json, os\n_MAN = os.path.join(os.path.dirname(__file__), '_overlay_manifest.json')\n"
+    woa = {"module": "sglang.kernels.ops.gemm.gfx95_batched_gemm_bf16_fp8_grid",
+           "file": "_patched/sglang.kernels.ops.gemm.gfx95_batched_gemm_bf16_fp8_grid.py"}
+    kf = {"module": "sglang.srt.models.deepseek_v4_platform_stage",
+          "file": "_patched/sglang.srt.models.deepseek_v4_platform_stage.py"}
+
+    def manifest(modules, **extra):
+        return json.dumps({"modules": modules, "rebinds": [], "markers": [], "captures": [], **extra})
+
+    patched_woa = "W = 1\n"
+    init_files = {"sitecustomize.py": site, "_overlay_manifest.json": manifest([woa]), woa["file"]: patched_woa}
+    cases = {
+        "superset": ({"_overlay_manifest.json": manifest([woa, kf]), woa["file"]: patched_woa,
+                      kf["file"]: "K = 1\n"}, None),
+        "dropped entry": ({"_overlay_manifest.json": manifest([kf]), woa["file"]: patched_woa,
+                           kf["file"]: "K = 1\n"}, "dropped or altered"),
+        "altered entry": ({"_overlay_manifest.json": manifest([{**woa, "file": kf["file"]}, kf]),
+                           woa["file"]: patched_woa, kf["file"]: "K = 1\n"}, "dropped or altered"),
+        "changed field": ({"_overlay_manifest.json": manifest([woa, kf], version=2), woa["file"]: patched_woa,
+                           kf["file"]: "K = 1\n"}, None),
+        "changed patched module": ({"_overlay_manifest.json": manifest([woa, kf]), woa["file"]: "W = 2\n",
+                                    kf["file"]: "K = 1\n"}, "was changed"),
+        "not json": ({"_overlay_manifest.json": "[", woa["file"]: patched_woa}, "not a JSON object"),
+    }
+    for i, (name, (files, needle)) in enumerate(cases.items()):
+        root = tmp_path / str(i)
+        run_dir = root / "e2e_x"
+        ov = make_overlay(run_dir, initial=files, site=site)
+        check = foc.validate_overlay(ov, _initial(root, init_files), run_dir)
+        if needle is None:
+            assert check["ok"], (name, check["problems"])
+        else:
+            assert not check["ok"] and any(needle in p for p in check["problems"]), (name, check["problems"])
+    # a field the initial manifest already had may not change
+    root = tmp_path / "field"
+    run_dir = root / "e2e_x"
+    ov = make_overlay(run_dir, initial={"_overlay_manifest.json": manifest([woa, kf], version=2),
+                                        woa["file"]: patched_woa}, site=site)
+    init = _initial(root, {**init_files, "_overlay_manifest.json": manifest([woa], version=1)})
+    check = foc.validate_overlay(ov, init, run_dir)
+    assert not check["ok"] and any("'version'" in p for p in check["problems"]), check["problems"]
