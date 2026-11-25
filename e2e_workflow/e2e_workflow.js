@@ -3583,8 +3583,9 @@ const KF_PROMPTS = String(A.kf_prompt || `${KF_SKILL_DIR}/SKILL.md`)
   .split(',').map((p) => p.trim()).filter(Boolean);   // several files drive one analysis
 // The fusion levels a fused kernel may implement; the analysis may recommend only these (it ranks all).
 const KF_LEVELS = String(A.kf_implementable_levels || 'L1,L2,L3');
-// Patterns inside those levels not implemented yet: ranked, but not recommended or routed.
-const KF_UNSUPPORTED = String(A.kf_unsupported_patterns || 'L3 MegaKernel (one persistent kernel that absorbs a heavy expert/GEMM or attention stage together with its dispatch, combine or communication, e.g. MegaMoE); L4 (whole-layer MonoKernel)');
+// Patterns inside those levels not implemented yet: ranked, but not recommended or routed. An L3 MegaKernel
+// (mega: true) is the analyst's call; its UT and lane run on a whole group of required_gpu_count GPUs.
+const KF_UNSUPPORTED = String(A.kf_unsupported_patterns || 'L4 (whole-layer MonoKernel)');
 const KF_TASK = String(A.kf_task || '');   // operator constraints, binding on every fusion agent
 // A finished analysis (run_e2e.py reads kf_topk_json into it): reused, not re-run.
 const KF_TOPK = A.kf_topk && typeof A.kf_topk === 'object' && Array.isArray(A.kf_topk.candidates) ? A.kf_topk : null;
@@ -3593,6 +3594,8 @@ const KF_UT_CONTRACT = `${WORKFLOW_DIR}/roles/_fragments/fusion_ut_contract.md`;
 // its SKILL.md), mapped onto the region UT and its hand-back by the fusion-kernel skill.
 const KF_COOPT_DIR = `${WORKFLOW_DIR}/knowledge/kernel_fusion_skills/co-optimization`;
 const KF_KERNEL_SKILL = `${WORKFLOW_DIR}/knowledge/kernel_fusion_skills/fusion-kernel/SKILL.md`;
+// How to write an L3 MegaKernel: a link the operator replaces with the Mega skill's address or file.
+const KF_MEGA_SKILL = String(A.kf_mega_skill || `${KF_COOPT_DIR}/MEGA_SKILL_LINK.md`);
 
 const KF_CANDIDATE_SCHEMA = obj({
   id: { type: 'string' },
@@ -3600,6 +3603,7 @@ const KF_CANDIDATE_SCHEMA = obj({
   exclusive_with: arrStr,
   fallback: { type: ['string', 'null'] },
   kernels: arrStr, phases: arrStr,
+  mega: { type: 'boolean' }, required_gpu_count: { type: 'number' }, comm: arrStr,
 }, ['id']);
 const KF_OPPORTUNITY_SCHEMA = obj({
   topk_json: { type: 'string' }, report_path: { type: 'string' }, digest_md: { type: 'string' },
@@ -3615,15 +3619,19 @@ const KF_OVERLAY_CHECK_SCHEMA = obj({ ok: { type: 'boolean' }, problems: arrStr,
 const KF_CAND_KEYS = ['id', 'rank', 'level', 'region', 'kernels', 'phases', 'occurrences', 'm_range', 'seam',
   'inputs_outputs', 'launches_before', 'launches_after', 'region_pct_device_time', 'est_gain_pct_expected',
   'difficulty', 'bitwise_exact', 'exclusive_with', 'language', 'fallback', 'fused_design',
-  'single_kernel_gain_pct_expected', 'route', 'gain_basis'];
+  'single_kernel_gain_pct_expected', 'route', 'gain_basis', 'mega', 'required_gpu_count', 'comm'];
 const KF_ROUTE_KEYS = ['id', 'rank', 'level', 'region', 'kernels', 'phases', 'm_range', 'seam',
   'region_pct_device_time', 'est_gain_pct_expected', 'single_kernel_gain_pct_expected', 'route', 'difficulty',
-  'bitwise_exact', 'exclusive_with', 'fallback'];
+  'bitwise_exact', 'exclusive_with', 'fallback', 'mega', 'required_gpu_count', 'comm'];
 const kfPick = (c, keys) => Object.fromEntries(keys.filter((k) => c[k] !== undefined).map((k) => [k, c[k]]));
 const kfList = (v) => (Array.isArray(v) ? v.map(String) : []);
 const kfSeamOf = (c) => (c && c.seam && c.seam.target_callable) || '';
 const kfShortOf = (c) => `kf_${String(c.id).replace(/[^A-Za-z0-9_]+/g, '_')}`;
 const kfIntro = (s) => s + (KF_TASK ? ` OPERATOR CONSTRAINTS (they bind you): ${KF_TASK}` : '');
+// An L3 MegaKernel region's GPU group size (its TP or EP rank count), 0 for any other region; why it cannot run here.
+function kfMegaN(c) { return c && c.mega ? Math.max(1, parseInt(c.required_gpu_count, 10) || 1) : 0; }
+function kfMegaShort(c) { const n = kfMegaN(c); return n > GPU_LIST.length ? `mega_needs_${n}_gpus` : ''; }
+const kfLevelOk = (c) => KF_LEVELS.split(',').map((l) => l.trim()).includes(String((c && c.level) || '').trim());
 // A region's entry of the fusion analysis, written into its UT as analysis.json (fusion_ut_contract.md).
 const kfAnalysisOf = (c) => ({ ...kfPick(c, KF_CAND_KEYS), topk_json: kfRecord.topk_json || '', report_path: kfRecord.report_path || '' });
 // What runs ahead of the search gets a bounded share of it: under time_budget_s the fusion profile and the
@@ -3647,7 +3655,7 @@ function kfAdopt(rec) {
   KF_INPUTS = !kfRegions.size ? {} : {
     FUSION_STRATEGY: `${WORKFLOW_DIR}/roles/_fragments/fusion_strategy.md`,
     FUSION_TOPK_JSON: rec.topk_json || '', FUSION_REPORT: rec.report_path || '',
-    FUSION_CANDIDATES: [...kfRegions.values()].map((c) => kfPick(c, KF_ROUTE_KEYS)),
+    FUSION_CANDIDATES: [...kfRegions.values()].filter((c) => !kfMegaShort(c)).map((c) => kfPick(c, KF_ROUTE_KEYS)),
     FUSION_RECOMMENDED: rec.recommended || [],
     IMPLEMENTABLE_LEVELS: KF_LEVELS, UNSUPPORTED_PATTERNS: KF_UNSUPPORTED,
     ...(KF_TASK ? { OPERATOR_CONSTRAINTS: KF_TASK } : {}),
@@ -3697,11 +3705,20 @@ async function kfProfile(phaseName) {
     // A structured result may give a seam as the bare "pkg.mod:fn" (topk.json on disk keeps the object).
     const candidates = (res.candidates || []).filter((c) => c && c.id != null).map((c) => kfPick({ ...c,
       seam: typeof c.seam === 'string' ? { target_callable: c.seam } : (c.seam && typeof c.seam === 'object' ? c.seam : {}),
-      kernels: kfList(c.kernels), phases: kfList(c.phases), exclusive_with: kfList(c.exclusive_with) }, KF_CAND_KEYS));
+      kernels: kfList(c.kernels), phases: kfList(c.phases), exclusive_with: kfList(c.exclusive_with),
+      comm: c.comm == null ? undefined : kfList([].concat(c.comm)) }, KF_CAND_KEYS));
     // A region the analysis judged worth less than optimizing its kernels one by one (route single_kernel)
     // stays with the single-kernel track: it is never prepared or routed as a region.
     const singleRoute = new Set(candidates.filter((c) => c.route === 'single_kernel').map((c) => String(c.id)));
-    const recommended = (res.recommended || []).map(String);
+    // The code holds the analysis to its scope: a recommended region outside KF_LEVELS is dropped, and an L3
+    // MegaKernel needing more GPUs than the run has is recorded unprepared (mega_needs_<N>_gpus).
+    const byId = new Map(candidates.map((c) => [String(c.id), c]));
+    const recommended = (res.recommended || []).map(String).filter((id) => {
+      const c = byId.get(id), short = kfMegaShort(c);
+      if (c && !kfLevelOk(c)) log(`[kf] ${id}: level ${c.level} is not in kf_implementable_levels (${KF_LEVELS}); not recommended.`);
+      else if (short) kfRecord.unprepared.push({ id, reason: short });
+      return !!c && kfLevelOk(c) && !short;
+    });
     kfAdopt(Object.assign(kfRecord, { status: 'profiled', topk_json: res.topk_json || '',
       report_path: KF_TOPK ? '' : (res.report_path || `${out}/REPORT.md`),
       candidates, recommended: recommended.filter((id) => !singleRoute.has(id)),
@@ -3718,10 +3735,11 @@ async function kfProfile(phaseName) {
 
 // AgentX: one kernel-extract invocation per recommended region builds its region UT under the fusion UT
 // contract from this run's evidence; a passing one joins the prepared inventory by its GPU-time share.
-async function kfPrepare(c, gpu, previous, throughput) {
+async function kfPrepare(c, gpu, previous, throughput, group) {
   const t = kfShortOf(c);
   const inputs = {
     EVAL_DIR, MODEL_PATH, GPU_ID: gpu, WORKLOAD, TASK, ROUND: t,
+    ...(group ? { GPU_GROUP: group.join(','), REQUIRED_GPU_COUNT: group.length } : {}),
     BASELINE_LOG: `${EVAL_DIR}/baseline/server.log`, BASELINE_BENCH_DIR: `${EVAL_DIR}/baseline`,
     BASELINE_SUMMARY: `${EVAL_DIR}/baseline_summary.md`,
     BASELINE_ITERATION_DIR: `${EVAL_DIR}/baseline/iterations`,
@@ -3734,7 +3752,7 @@ async function kfPrepare(c, gpu, previous, throughput) {
     TRACE_DIR: kfRecord.trace_dir,
     FUSION_SCOPE: [{ task: t, fusion_level: c.level, region: c.region, device_kernels: c.kernels || [],
       phases: c.phases || [], seam: c.seam || {}, inputs_outputs: c.inputs_outputs || '', m_range: c.m_range || '',
-      analysis: kfAnalysisOf(c) }],
+      ...kfPick(c, ['mega', 'required_gpu_count', 'comm']), analysis: kfAnalysisOf(c) }],
     SOURCE_DELIVERY_REQUIRED: true, REMAINING_MIN: Math.min(remainingMin(), Math.round(kfLeftMs() / 60000)),
     SKILL_DIR: WORKFLOW_DIR, ...TRACELENS_INPUTS, ...ANALYSIS_SKILL_INPUTS, ...KB_REF_INPUTS,
   };
@@ -3780,11 +3798,14 @@ async function kfPrepareRegions(prepared, throughput) {
   const picks = (kfRecord.recommended || []).map((id) => kfRegions.get(String(id))).filter((c, i, a) => c && a.indexOf(c) === i);
   const got = await parallel(picks.map((c, i) => async () => {
     if (!kfSeamOf(c)) return { c, why: 'no seam.target_callable' };
+    if (kfMegaShort(c)) return { c, why: kfMegaShort(c) };
     if (late()) return { c, why: 'time: the fusion share of the search window is spent' };
-    const gpu = GPU_LIST[i % GPU_LIST.length];
     try {
-      const first = await kfPrepare(c, gpu, null, throughput);
-      return { c, ...(first.k || late() ? first : await kfPrepare(c, gpu, String(first.why).slice(0, 1500), throughput)) };
+      return await kfGpuGroup(c, async (group) => {
+        const gpu = group ? group[0] : GPU_LIST[i % GPU_LIST.length];
+        const first = await kfPrepare(c, gpu, null, throughput, group);
+        return { c, ...(first.k || late() ? first : await kfPrepare(c, gpu, String(first.why).slice(0, 1500), throughput, group)) };
+      });
     } catch (e) {
       return { c, why: `error: ${String((e && e.message) || e).slice(0, 300)}` };
     }
@@ -3801,6 +3822,12 @@ async function kfPrepareRegions(prepared, throughput) {
   log(`[kf] region UTs: ${fused.length} of ${picks.length} recommended region(s) joined the prepared inventory.`);
   return prepared;
 }
+// An L3 MegaKernel region's UT runs on a whole group: its preparation leases required_gpu_count cards (makeSem,
+// so two groups never overlap), every other region keeps its one card. Its lanes get the group as gpu_ids with
+// gpus_per_job = required_gpu_count: kernel_lane.js leases the N cards per command (gpu_lock pool:N:<ids>).
+let KF_GPUS = null;   // made on first use
+const kfGpuGroup = (c, fn) => (kfMegaN(c) ? (KF_GPUS = KF_GPUS || makeSem(GPU_LIST)).with(kfMegaN(c), fn) : fn(null));
+const kfLaneGpus = (c) => { const n = kfMegaN(kfRegionOf(c)); return !n ? {} : { gpu_ids: GPU_LIST.slice(0, n).join(','), gpus_per_job: n }; };
 function kfMerge(queue, fused) {
   const out = (queue || []).slice();
   for (const f of fused) {
@@ -3833,7 +3860,8 @@ const kfExtractIntro = (c) => (!kfRegionOf(c) ? '' : kfIntro(
   `Build the immutable unittest task dir for a FUSION REGION, not a single kernel. Read ${KF_UT_CONTRACT} first: ` +
   'its FUSION UT CONTRACT and its kernel_extractor section are your scope for this invocation.'));
 const kfExtractInputs = (c) => (!kfRegionOf(c) ? {} : { FUSION_ANALYSIS: kfAnalysisOf(kfRegionOf(c)),
-  ...(A.kf_workload_summary ? { WORKLOAD_SUMMARY: String(A.kf_workload_summary) } : {}) });
+  ...(A.kf_workload_summary ? { WORKLOAD_SUMMARY: String(A.kf_workload_summary) } : {}),
+  ...(kfLaneGpus(c).gpu_ids ? { GPU_GROUP: kfLaneGpus(c).gpu_ids, REQUIRED_GPU_COUNT: kfLaneGpus(c).gpus_per_job } : {}) });
 function kfLaneTask(c) {
   const r = kfRegionOf(c);
   if (!r) return '';
@@ -3842,11 +3870,13 @@ function kfLaneTask(c) {
     m_range: r.m_range || '', seam: r.seam || {}, inputs_outputs: r.inputs_outputs || '',
     launches_before: r.launches_before || (r.kernels || []).length, launches_after: r.launches_after || 1,
     suggested_design: r.fused_design || '', bitwise_exact_expected: !!r.bitwise_exact,
-    ...kfPick(r, ['est_gain_pct_expected', 'single_kernel_gain_pct_expected', 'gain_basis']) };
+    ...kfPick(r, ['est_gain_pct_expected', 'single_kernel_gain_pct_expected', 'gain_basis', 'mega', 'required_gpu_count', 'comm']) };
+  const mega = !kfMegaN(r) ? '' : ` L3 MEGAKERNEL on ${kfMegaN(r)} ranks: follow the fusion-kernel skill's Mega chapter, ` +
+    `starting from the Mega skill ${KF_MEGA_SKILL}; the region UT runs every rank (scripts/mp_harness.py).`;
   return `FUSION REGION ${r.id} (${r.level || '?'}): write ONE fused ${lang} kernel that replaces this whole ` +
     `kernel region of a live LLM serving stack. Read first, in this order: ${KF_COOPT_DIR}/fusion_kernel_prompt.md ` +
     `(the method, steps 0-7), ${KF_COOPT_DIR}/SKILL.md (§0.1, §0.2), then ${KF_KERNEL_SKILL} (the task dir and ` +
-    'hand-back) and the references they link. The region: ' +
+    'hand-back) and the references they link.' + mega + ' The region: ' +
     JSON.stringify(region) + '. ' + GRAPH_REQ + (TASK || '') + (KF_TASK ? ` OPERATOR CONSTRAINTS: ${KF_TASK}` : '');
 }
 // The integrate A/B of a region: its facts in KERNEL_RESULT and the accuracy gate, both in the inputs, so
@@ -3943,7 +3973,7 @@ async function kfSlotCand(h, k) {
     r = await fastBoundedWorkflow({ scriptPath: KERNEL_WF_SCRIPT }, {
       kernel_path: x.task_dir, workflow_dir: KERNEL_WF_DIR,
       use_expert_skills: USE_EXPERT_SKILLS ? 'true' : 'false', expert_skills_dir: EXPERT_SKILLS_DIR, ...KB_ARGS,
-      budget: KERNEL_BUDGET, gpu_ids: c.gpu_id, exp_root: `${EVAL_DIR}/kernels/_exp`,
+      budget: KERNEL_BUDGET, gpu_ids: c.gpu_id, exp_root: `${EVAL_DIR}/kernels/_exp`, ...kfLaneGpus(c),
       task: kfLaneTask(c), apply_to_original: 'false',
     }, tag);
   } catch (e) {
@@ -4007,7 +4037,7 @@ async function kfHandbackGate(c, taskDir, lane, phaseName) {
   const res = await safeAgent('Run EXACTLY this command and nothing else:\n```bash\n' +
     `python3 ${shq(`${WORKFLOW_DIR}/scripts/fusion_handback.py`)} assemble --check --task-dir ${shq(taskDir)} ` +
     `--final-patch ${shq(lane.final_patch || '')} --out ${shq(out)} --lane-result ${shq(laneJson)} ` +
-    `--region ${shq(JSON.stringify({ phases: c.phases || [], m_range: c.m_range || '' }))}\n` + '```\nIt prints ' +
+    `--region ${shq(JSON.stringify({ phases: c.phases || [], m_range: c.m_range || '', ...kfPick(kfRegionOf(c), ['required_gpu_count']) }))}\n` + '```\nIt prints ' +
     'one JSON object (and exits 1 when the check fails). Return that object EXACTLY as printed. Do NOT modify any ' +
     'file and do NOT run anything else.',
     { phase: phaseName, label: `handback ${c.short_name}`, effort: 'low', schema: KF_HANDBACK_SCHEMA }, 1, () => 10 * 60000);
@@ -6401,7 +6431,7 @@ while (want('kernel') && !TIME_DEADLINE_HIT && dispatched < BUDGET && (dispatche
         kernel_path: ext.task_dir, workflow_dir: KERNEL_WF_DIR,
         use_expert_skills: USE_EXPERT_SKILLS ? 'true' : 'false', expert_skills_dir: EXPERT_SKILLS_DIR,
         ...KB_ARGS,
-        budget: KERNEL_BUDGET, gpu_ids: c.gpu_id, exp_root: `${EVAL_DIR}/kernels/_exp`,
+        budget: KERNEL_BUDGET, gpu_ids: c.gpu_id, exp_root: `${EVAL_DIR}/kernels/_exp`, ...(KF_ON && kfLaneGpus(c)),
         task: (KF_ON && kfLaneTask(c)) || 'Compare candidate backends ' + JSON.stringify(c.candidate_backends || []) +
           ' for this kernel; pick the fastest that passes the immutable unittest. ' + GRAPH_REQ + (TASK || ''),
         apply_to_original: 'false',

@@ -38,6 +38,8 @@ _KNOBS = {
     "task": ("GEAK_KF_TASK", "kf_task"),
     # a single kernel's assumed speedup when the analysis gave no estimate (HeadKernel's Amdahl fallback)
     "single_speedup_prior": ("GEAK_KF_SINGLE_SPEEDUP_PRIOR", "kf_single_speedup_prior"),
+    # how to write an L3 MegaKernel: an address or a file (default: co-optimization/MEGA_SKILL_LINK.md)
+    "mega_skill": ("GEAK_KF_MEGA_SKILL", "kf_mega_skill"),
 }
 _PATH_ARGS = ("kf_prompt", "kf_trace_dir", "kf_workload_summary", "kf_topk_json")
 
@@ -85,7 +87,9 @@ CAND_KEYS = ("id", "rank", "level", "region", "kernels", "phases", "occurrences"
              "launches_before", "launches_after", "region_pct_device_time", "est_gain_pct_expected", "difficulty",
              "bitwise_exact", "exclusive_with", "language", "fallback", "fused_design",
              # the route against optimizing the region's kernels one by one: "single_kernel" is never prepared or routed
-             "single_kernel_gain_pct_expected", "route", "gain_basis")
+             "single_kernel_gain_pct_expected", "route", "gain_basis",
+             # an L3 MegaKernel region runs its UT and lane on a whole group of required_gpu_count GPUs
+             "mega", "required_gpu_count", "comm")
 # every TopK single-kernel hotspot's expected gain alone: HeadKernel orders heads and regions by it
 HOTSPOT_KEYS = ("kernel", "pct_gpu_time", "single_kernel_gain_pct_expected", "basis")
 
@@ -127,6 +131,10 @@ def build_args(cfg: dict) -> dict:
         if arg and cfg.get(key) not in (None, ""):
             a[arg] = cfg[key]
     a["kf_prompt"] = ",".join(prompt_files(cfg))
+    ms = str(a.get("kf_mega_skill") or "")
+    if ms and "://" not in ms:
+        # a file is resolved like the other paths; an address (URL) is passed as it is
+        a["kf_mega_skill"] = str(Path(ms).expanduser().resolve())
     for path_key in _PATH_ARGS:
         if a.get(path_key):
             # kf_prompt may name several files (comma-separated): all of them drive the analysis.

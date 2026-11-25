@@ -109,8 +109,16 @@ candidate:
   route ("fusion" when est_gain_pct_expected is larger than single_kernel_gain_pct_expected, else "single_kernel";
         "single_kernel" also for a region whose only gain is fewer launches),
   gain_basis (one line: the nodes removed, intermediate bytes, t_floor, edge classes D0-D4 and rewrites, and the
-        covered share the two gains come from).
+        covered share the two gains come from),
+  mega (true for an L3 MegaKernel: one persistent kernel that absorbs a heavy expert/GEMM or attention stage
+        together with its dispatch, combine or communication; false otherwise),
+  required_gpu_count (the ranks one run of the region takes: the TP or EP size of the seam's group for a MegaKernel,
+        1 otherwise), comm (the collectives inside the region: "all_reduce", "dispatch", "combine", ...; [] when none).
 ```
+For every hotspot, compare the single-kernel route with L1, L2, L3 stage fusion and L3 MegaKernel (and rank L4)
+on the same weights, and set the route yourself: an L3 MegaKernel is recommendable like any L3 region when it is
+expected to win. The workflow drops a recommended id whose level is not in `IMPLEMENTABLE_LEVELS`, and records a
+MegaKernel that needs more GPUs than the run has as unprepared (`mega_needs_<N>_gpus`).
 Also write a top-level `"hotspots"` list in topk.json: one entry for EVERY single-kernel hotspot of the TopK
 (`PROFILE_TOPN`, or the kernel ranking of this run's preparation; every kernel listed there, in a region or not),
 `{"kernel": "<device kernel name as in the trace>", "pct_gpu_time": <weighted %>, "single_kernel_gain_pct_expected":

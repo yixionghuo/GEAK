@@ -55,8 +55,9 @@ A candidate that does not meet all of the following must not be recommended.
    affect it rank last.
 4. **Implementation scope.** Rank every level as found. Only candidates at an implementable level and not
    matching an unsupported pattern may be recommended; mark the others "not implementable in this stage" and
-   name the reason (level or pattern). An L3 stage-wise fusion that is not a MegaKernel (see
-   [fusion levels](references/fusion-levels.md)) is in scope when L3 is implementable. The recommended set must be
+   name the reason (level or pattern). An L3 stage-wise fusion, or an L3 MegaKernel unless the caller lists it as
+   unsupported (see [fusion levels](references/fusion-levels.md)), is in scope when L3 is implementable; a MegaKernel
+   records the ranks one run takes (its TP or EP size) and the collectives it absorbs. The recommended set must be
    mutually compatible: its candidates take effect together.
 5. **Complete coverage (boundary ledger).** For each phase that drives the target metric, use that
    phase's own trace sequence (never another phase's; list every path when layers differ). List the

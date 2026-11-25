@@ -46,8 +46,14 @@ const C4 = { id: 'c4', rank: 5, level: 'L2', region: 'gemm + bias + gelu', kerne
 // on_agentx_route: the analysis judges c1 worth more as single-kernel work (route single_kernel) but still
 // lists it in "recommended": the workflow must drop it.
 const ROUTE = scenario.includes('route');
+// *_mega: two L3 MegaKernel regions, c5 on 2 ranks (the run has 2 GPUs) and c6 on 4 (it cannot run here).
+const MEGA = scenario.includes('mega');
+const C5 = { id: 'c5', rank: 6, level: 'L3', region: 'row-parallel GEMM + all-reduce', mega: true, required_gpu_count: 2,
+  comm: ['all_reduce'], kernels: ['gemm_ar_kernel', 'cross_device_reduce_kernel'], seam: { target_callable: 'pkg.tp:Row.forward' },
+  region_pct_device_time: 8, est_gain_pct_expected: 4, phases: ['DECODE'] };
+const C6 = { ...C5, id: 'c6', required_gpu_count: 4, est_gain_pct_expected: 5, seam: { target_callable: 'pkg.moe:Mega.forward' } };
 // on_head_kfhigh: c2 is estimated above every head, so its own slot runs first.
-const REGIONS = (HEAD ? [...CANDS, C4] : CANDS).map((c) => (ROUTE && c.id === 'c1'
+const REGIONS = [...(HEAD ? [...CANDS, C4] : CANDS), ...(MEGA ? [C5, C6] : [])].map((c) => (ROUTE && c.id === 'c1'
   ? { ...c, route: 'single_kernel', single_kernel_gain_pct_expected: 3.5 }
   : scenario.includes('kfhigh') && c.id === 'c2' ? { ...c, est_gain_pct_expected: 9 } : c));
 const ext = (id) => ({ short_name: id, editable: true, task_dir: `${EV}/tasks/${id}`, unittest_smoke: 'pass',
@@ -153,12 +159,16 @@ const answers = {
   // On AgentX the analyst also recommends c3, which has no seam: it gets no region UT.
   'fusion_analyst:analyze': () => (scenario === 'on_error' ? null : { topk_json: `${EV}/kernel_fusion/analysis/topk.json`,
     report_path: `${EV}/kernel_fusion/analysis/REPORT.md`, report_md: '# report', candidates: REGIONS,
-    recommended: [...(AGX ? ['c1', 'c2', 'c3'] : ['c1', 'c2']), ...(HEAD ? ['c4'] : [])], hotspots: HOTSPOTS }),
+    recommended: [...(AGX ? ['c1', 'c2', 'c3'] : ['c1', 'c2']), ...(HEAD ? ['c4'] : []), ...(MEGA ? ['c5', 'c6'] : [])],
+    hotspots: HOTSPOTS }),
   // --- AgentX: one prepared single kernel; the recommended regions get their own region UT ---
   'kernel_extractor:prepare baseline': () => prepared('baseline', [['k_norm', 5, 'norm']], HEAD ? [AX_HEAD] : []),
   'kernel_extractor:prepare kf_c1': () => prepared('kf_c1', [['kf_c1', 4, 'fusion']]),
   'kernel_extractor:prepare kf_c2': () => prepared('kf_c2', [['kf_c2', 6, 'fusion']]),
   'kernel_extractor:prepare kf_c4': () => prepared('kf_c4', [['kf_c4', 22, 'fusion']]),
+  'kernel_extractor:prepare kf_c5': () => prepared('kf_c5', [['kf_c5', 8, 'fusion']]),
+  'integrate kf_c5': () => fusedInteg('kf_c5', 0.5, { e2e_throughput_tok_s: 100.5 }),
+  'overlay-check kf_c5': () => ({ ok: true, problems: [], manifest_sha256: 'f'.repeat(64), files: 2 }),
   // AgentX runs best estimate first: kf_c1 (2.7), kf_c2 (1.5), k_norm (Amdahl 0.84), each above the last.
   'integrate k_norm': () => integ('k_norm', 'accepted', 2, { e2e_throughput_tok_s: 120 }),
   'integrate kf_c1': () => fusedInteg('kf_c1', 1, { e2e_throughput_tok_s: HEAD ? 108 : 101 }),
@@ -204,6 +214,7 @@ const args = {
   ...(scenario === 'on_topk' ? { kf_topk_json: '/data/topk.json', kf_topk: { recommended: ['c1', 'c2'], hotspots: HOTSPOTS,
     candidates: CANDS.map((c) => (c.id === 'c2' ? { ...c, seam: C2_SEAM } : c)) } } : {}),
   ...(scenario.includes('budget1') ? { head_budget: 1 } : {}),
+  ...(scenario.includes('levels') ? { kf_implementable_levels: 'L1,L2' } : {}),
   ...(scenario === 'on_setup' ? { phases: 'setup' } : {}),
   ...(scenario === 'on_resume' ? { phases: 'kernel,final',
     state: JSON.parse(await readFile(process.env.KF_MOCK_STATE, 'utf8')) } : {}),

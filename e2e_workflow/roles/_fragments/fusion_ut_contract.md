@@ -38,10 +38,11 @@ Record `"fusion_contract": true` in meta.json.
 ## The unified task dir (L1–L4 share it)
 
 Every fusion region's UT, whatever its level and whoever implements it, is one GEAK task dir with these
-additions. L1–L3 use what is below; L3 MegaKernel and L4 add their layer-level fields later.
+additions. L1–L3 use what is below; an L3 MegaKernel region adds the multi-rank part ("L3 MegaKernel" below);
+L4 adds its layer-level fields later.
 
 - **`meta.json`**, beside the fields GEAK already writes:
-  - `fusion_contract: true`, `level` (`L1` / `L2` / `L3`);
+  - `fusion_contract: true`, `level` (`L1` / `L2` / `L3`), `mega` (`true` only for an L3 MegaKernel);
   - `analysis`: `"analysis.json"`;
   - `cases`: one entry per served case, `{"sig", "step_type", "width", "context", "weight"}` (step_type:
     prefill_chunk / decode / target_verify / draft; weight = its served share), the same signatures the
@@ -63,15 +64,50 @@ additions. L1–L3 use what is below; L3 MegaKernel and L4 add their layer-level
   `kernel_src/` files are replaced by the control's): each must exit 1 (correctness FAIL; a build or
   import error does not count). Record the runs in `run/controls_result.json`, and point the source-delivery
   record's `negative_control_ref` at it.
-- No `selfcheck.json`: the self-check is `run/ut_result.json` (the unchanged `kernel_src/` passes with
-  speedup ≈ 1.0), `run/self_noise.json` and `run/controls_result.json`.
+- **`selfcheck.json`** (every level): the UT's self-check before it is handed to an implementer, summarized
+  from the evidence under `run/` (`run/ut_result.json`, `run/self_noise.json`, `run/controls_result.json`):
+  `{"stock_passes": true, "max_err_over_tol": <max err of the unchanged kernel_src/ ÷ tol, must be ≤ 0.1>,
+  "stock_speedup": <weighted speedup of the unchanged kernel_src/, must be in 0.90–1.10>,
+  "controls": {"<name>": "fail" | "pass", ...} (every `must_fail` control "fail"), "ok": true, "evidence": [<run/ files>]}`.
+  The unchanged `kernel_src/` passes every check, its error is at most 0.1·tol and its speedup is 0.90–1.10;
+  every negative control is judged as `controls.json` says. A task whose self-check is not `ok` is not delivered.
+
+## L3 MegaKernel (`mega: true`)
+
+A MegaKernel region absorbs a heavy expert/GEMM or attention stage together with its dispatch, combine or
+communication, so its seam spans ranks. The task dir is the same; these parts are added or change:
+
+- **`meta.json`**: `level: "L3"`, `mega: true`, `tp`, `ep` (the deployment's), `required_gpu_count` (the ranks one
+  run takes: the TP or EP size of the seam's group, from the region's `required_gpu_count`), `comm` (the
+  collectives inside the seam: all-reduce, dispatch, combine, ...), and the fields above (`cases[]` per step type ×
+  width × context with served weights, `regime.speculative`, `acceptance`, `analysis`).
+- **Multi-rank harness**: `unittest.py` runs every case on `required_gpu_count` ranks through GEAK's
+  `scripts/mp_harness.py` (copy it into the task beside `harness_lib.py`, unchanged): one process per rank,
+  bounded process-group initialization, the same cases module on both legs, only the seam's outputs compared
+  (the max error of each rank, reduced to the max over ranks), each case timed per rank and reduced to the
+  slowest rank. The protocol lines are the same: `CORRECTNESS: PASS|FAIL` (per rank), `case <sig>: ...`,
+  `GEAK_GEOMEAN_SPEEDUP` / `GEAK_WEIGHTED_SPEEDUP`. Work only on the GPUs in `GPU_GROUP` (the group of
+  `REQUIRED_GPU_COUNT` cards KernelFusion leased for this task), never on the rest of the pool.
+- **`weights/`**: per rank (`weights/rank<r>/`), the tensors the framework actually uses after loading, including
+  those outside the module tree (re-ordered expert weights, scales, routing tables). Load them, never re-derive
+  them from the checkpoint at test time.
+- **`reference_io/`**: per rank (`reference_io/rank<r>/`), the seam's inputs and outputs of every case captured
+  from the ONLINE server (a capture hook on the live seam, every rank of one step). This is the Mega-only
+  exception to the kernel-extract default (frozen-baseline outputs from generated inputs): a cross-rank seam's
+  inputs (routing, peer buffers, metadata) cannot be generated faithfully. Note the capture in `run/`.
+- **`controls/`**: beside `perturb_output` (scaled by `1 + 4·tol`), at least `single_rank_deviation` (one rank's
+  output is off by 4·tol, the others exact), `missing_communication` (the candidate skips a collective and
+  returns its local result), and `stale_output` (returns the previous step's output, or a buffer it did not
+  write this call). Each must FAIL on the rank(s) it breaks.
+- **Hand-back**: `support.json` adds `required_gpu_count` (the same as the UT's); `init.py` prepares every rank
+  (symmetric-memory / IPC registration, JIT of every width) before the KV cache is sized.
 
 ## The hand-back the UT is accepted against
 
 Whoever implements the region hands back one directory (`scripts/fusion_handback.py`): `kernel_src/` (the
 only change), `support.json` (`phases`, `m_range` or `widths`, `dtypes`, `refusals`: where it engages and
-where it falls back to the stock path), `init.py` (optional), `ut_result.json` (this UT's result on it) and
-`notes.md`. A GEAK kernel lane produces it through the fusion-kernel skill. KernelFusion checks it against
+where it falls back to the stock path; `required_gpu_count` for an L3 MegaKernel), `init.py` (optional),
+`ut_result.json` (this UT's result on it) and `notes.md`. A GEAK kernel lane produces it through the fusion-kernel skill. KernelFusion checks it against
 this task dir (`acceptance.min_speedup`, the candidate_bind file) before the e2e A/B.
 
 ## AgentX: the kernel-extract skill (PHASE=prepare)
@@ -86,8 +122,8 @@ do not launch a new full replay. This region is your ONLY job and the time in RE
 yours: do not defer or stop early for budget. When an input is hard to reconstruct (quantized checkpoint
 operands, split/partial buffers, library-op wrappers), build it the way the live path does -- load the
 real tensors from MODEL_PATH, call the live producer, or bind below the wrapper -- and verify by running
-it. Other regions are prepared in parallel on the other GPUs: use only GPU_ID for UT work and write only
-under EVIDENCE_DIR and your task dir. Complete source extraction, UT authoring and GPU validation, keep a
+it. Other regions are prepared in parallel on the other GPUs: use only GPU_ID (an L3 MegaKernel region: the
+whole group in GPU_GROUP, REQUIRED_GPU_COUNT ranks) for UT work and write only under EVIDENCE_DIR and your task dir. Complete source extraction, UT authoring and GPU validation, keep a
 failure in the delivery with its concrete blocker, pack with `agentx_kernel_preparation.mjs
 --emit-prepared` and return ONLY {delivery_path, prepared} (prepared = that command's stdout VERBATIM).
 Do not optimize or integrate.

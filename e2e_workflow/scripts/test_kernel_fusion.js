@@ -8,6 +8,8 @@
 //     measures each one with GEAK's own extract, integrate A/B, Finalize-gate and Validate;
 //   - HeadKernel runs gain-ordered slots: a head with the regions on its own kernels, every other region a slot of
 //     its own; inside a slot the candidates run best estimate first and meet in one A/B (KF off: GEAK's own order);
+//   - an L3 MegaKernel region runs its UT and lane on a GPU group (or is unprepared when the run has too few GPUs),
+//     and a recommended region outside kf_implementable_levels is dropped;
 //   - every outcome (accepted, pending, overlay rejected, unknown region, failed or unconfigured profile,
 //     fast/deep mode, a given topk, AgentX, a resumed run) ends cleanly and the run goes on to Validate.
 //
@@ -221,8 +223,13 @@ ok(ex.includes('FUSION_ANALYSIS') && ex.includes('"est_gain_pct_expected":1.5') 
   'the region UT gets the region\'s analysis entry (written into the task as analysis.json)');
 const utc = fs.readFileSync(path.join(WF_DIR, 'roles', '_fragments', 'fusion_ut_contract.md'), 'utf8');
 ok(['## The unified task dir (L1–L4 share it)', '`level`', '`acceptance`', '`regime.speculative`', '**`analysis.json`**',
-  'controls/controls.json', 'run/controls_result.json', 'No `selfcheck.json`', '## The hand-back the UT is accepted against']
-  .every((k) => utc.includes(k)), 'fusion_ut_contract.md: the unified task dir and the hand-back it is accepted against');
+  'controls/controls.json', 'run/controls_result.json', '**`selfcheck.json`** (every level)', '0.90–1.10',
+  '## The hand-back the UT is accepted against'].every((k) => utc.includes(k)) && !utc.includes('No `selfcheck.json`'),
+  'fusion_ut_contract.md: the unified task dir, its self-check at every level, and the hand-back it is accepted against');
+ok(['## L3 MegaKernel', '`required_gpu_count`', '`tp`', '`ep`', 'weights/rank<r>/', 'reference_io/rank<r>/', 'ONLINE',
+  'single_rank_deviation', 'missing_communication', 'stale_output', '4·tol', 'scripts/mp_harness.py']
+  .every((k) => utc.includes(k)) && !/add their layer-level fields later/.test(utc),
+  'fusion_ut_contract.md: the L3 MegaKernel part (per-rank weights and online reference I/O, multi-rank controls)');
 const hbp = promptOf(on, 'handback kf_c2');
 ok(before(on, 'handback kf_c2', 'integrate kf_c2') && hbp.includes('fusion_handback.py') && hbp.includes(`--task-dir '${EV}/tasks/kf_c2'`) &&
   hbp.includes(`--out '${EV}/kernel_fusion/handback/kf_c2'`) && !labels(on).includes('handback mk_gemm') &&
@@ -304,6 +311,36 @@ ok(/### Step 5 — Fusion against the single-kernel route/.test(fa) && /Recommen
 ok(['~2 µs', '7 TB/s', 't_floor', 'D3', 'D4', 'Launch-only regions', 'Coverage', 'gain_basis', '07_kernel_to_e2e.md', 'Every single-kernel hotspot']
   .every((k) => fa.includes(k)) && /"hotspots"/.test(role) && /gain_basis/.test(role) && /co-optimization/.test(role),
   'gains are estimated by the co-optimization method; the analyst returns gain_basis and every TopK hotspot');
+
+console.log('\n## E2. L3 MegaKernel on a whole GPU group; the recommended set held to KF_LEVELS');
+ok(/const KF_UNSUPPORTED = String\(A\.kf_unsupported_patterns \|\| 'L4 \(whole-layer MonoKernel\)'\);/.test(src) &&
+  /budget: KERNEL_BUDGET, gpu_ids: c\.gpu_id, exp_root: `\$\{EVAL_DIR\}\/kernels\/_exp`, \.\.\.kfLaneGpus\(c\),/.test(src) &&
+  count('...(KF_ON && kfLaneGpus(c)),') === 1,
+  'only L4 is unsupported by default; a Mega lane gets its group in a HeadKernel slot and in the Milestone loop');
+const mg = run('on_agentx_mega');
+const pm = promptOf(mg, 'kernel_extractor:prepare kf_c5'), lm = laneOf(mg, 'kf_c5');
+ok(pm.includes('- GPU_GROUP: 0,1') && pm.includes('- REQUIRED_GPU_COUNT: 2') && /"mega":true,"required_gpu_count":2,"comm":\["all_reduce"\]/.test(pm) &&
+  !/GPU_GROUP|REQUIRED_GPU_COUNT/.test(promptOf(mg, 'kernel_extractor:prepare kf_c2')),
+  'Mega: its region UT is prepared on a leased group of required_gpu_count GPUs (GPU_GROUP); other regions keep one');
+ok(lm.gpus_per_job === 2 && lm.gpu_ids === '0,1' && /L3 MEGAKERNEL on 2 ranks/.test(lm.task) &&
+  lm.task.includes('co-optimization/MEGA_SKILL_LINK.md') && !('gpus_per_job' in laneOf(mg, 'kf_c2')) &&
+  !/MEGAKERNEL/.test(laneOf(mg, 'kf_c2').task),
+  'Mega: its lane runs on the group (gpu_ids, gpus_per_job) and reads the kf_mega_skill link first');
+ok(promptOf(mg, 'handback kf_c5').includes('"required_gpu_count":2') && names(mg).includes('kf_c5'),
+  'Mega: the hand-back states the ranks, and the region is A/B\'d and banked like any other');
+ok(kfOf(mg).unprepared.some((u) => u.id === 'c6' && u.reason === 'mega_needs_4_gpus') &&
+  !labels(mg).includes('kernel_extractor:prepare kf_c6') && !kfOf(mg).recommended.includes('c6'),
+  'Mega: a region needing more GPUs than the run has is unprepared (mega_needs_4_gpus), never prepared');
+const lv = run('on_agentx_levels');
+ok(same(kfOf(lv).recommended, ['c1', 'c2']) && !labels(lv).includes('kernel_extractor:prepare kf_c3') &&
+  !kfOf(lv).unprepared.some((u) => u.id === 'c3') &&
+  lv.logs.some((l) => l.startsWith('[kf] c3: level L3 is not in kf_implementable_levels (L1,L2)')),
+  'a recommended region outside kf_implementable_levels is dropped by the code, not only by the prompt');
+const fkm = fs.readFileSync(path.join(WF_DIR, 'knowledge', 'kernel_fusion_skills', 'fusion-kernel', 'SKILL.md'), 'utf8');
+const link = path.join(WF_DIR, 'knowledge', 'kernel_fusion_skills', 'co-optimization', 'MEGA_SKILL_LINK.md');
+ok(/## L3 MegaKernel/.test(fkm) && /kf_mega_skill/.test(fkm) && /B10/.test(fkm) && /B14/.test(fkm) && /C10/.test(fkm) &&
+  /trap 13/.test(fkm) && fs.existsSync(link) && /will supply/.test(fs.readFileSync(link, 'utf8')),
+  'fusion-kernel: a Mega chapter that starts from the kf_mega_skill link (a placeholder until the user supplies it)');
 
 console.log('\n## F. phase by phase: a resumed run keeps the fusion profile');
 const setup = run('on_setup');
