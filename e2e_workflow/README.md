@@ -410,7 +410,7 @@ that name a `fusion_id` (`roles/_fragments/fusion_strategy.md`, read only when `
 input). **The milestone loop** then treats a region like any kernel candidate: a region UT from
 `kernel_extractor` (on AgentX, prepared at KernelExtract by the kernel-extract skill) under
 `roles/_fragments/fusion_ut_contract.md`, one fused kernel from a `kernel_lane.js` run that follows the
-`fusion-kernel` skill (tune the heavy member, then fuse), and the integrate
+co-optimization skill's fusion kernel prompt and the `fusion-kernel` skill (parity floor first, then fuse), and the integrate
 A/B on the overlay accepted so far, with its finish retries, speedup review, corrective re-author and
 Finalize-gate replay. A region on a head's own kernel (typically an L2 region on a GEMM or attention head) is built
 the same way in **HeadKernel** instead, as one more candidate in that head's slot: the head's A/B measures
@@ -574,6 +574,7 @@ knowledge/analysis_skills/  pluggable profile-analysis skills (INDEX.md + one di
 knowledge/tuning_skillset_integration.md  how the VENDORED ../tuning_skillset/ is wired in (+ its manifest)
 knowledge/kernel_fusion_skills/  fusion-analysis (the opt-in fusion profile, + its trace digest scripts/kf_trace_digest.py) and
                                  fusion-kernel (what a kernel lane follows to write a region's fused kernel)
+                                 co-optimization (the fusion method both follow: gain estimate, prompt steps 0-7)
 knowledge/kernel_fusion_integration.md  how opt-in KernelFusion is wired into the stages (switch, knobs, record)
 scripts/               bench_e2e.sh (backend-agnostic dispatcher), adapters/{sglang,vllm,atom}.sh, parse_profile.py (Top-N), op_bench.py, capture_shapes.py, overlay_setup.py
 scripts/adapters/clients/  pluggable BENCH CLIENTS (the timed load): agentx.sh (AgentX trace replay via aiperf) + map_aiperf.py vendored beside it so a standalone run needs no InferenceX checkout

@@ -33,6 +33,9 @@ const CANDS = [
     seam: { target_callable: 'pkg.moe:prep' }, region_pct_device_time: 1, est_gain_pct_expected: 0.4 },
   { id: 'c3', rank: 4, level: 'L3', region: 'moe stage', kernels: ['a', 'b'], seam: {}, est_gain_pct_expected: 9 },
 ];
+// Every TopK single-kernel hotspot's gain alone (the analysis' "hotspots"); noise fields are dropped.
+const HOTSPOTS = [{ kernel: 'gemm_kernel', pct_gpu_time: 12, single_kernel_gain_pct_expected: 1.2, basis: 'untuned', x: 1 },
+  { kernel: 'gemm_bf16_kernel', pct_gpu_time: 20, single_kernel_gain_pct_expected: 2.5, basis: 'tuned lib' }];
 // The head scenarios add c4, an L2 region on the head h_gemm's own kernel (GEMM + bias + GELU).
 const C4 = { id: 'c4', rank: 5, level: 'L2', region: 'gemm + bias + gelu', kernels: ['gemm_bf16_kernel', 'gelu_kernel'],
   seam: { target_callable: 'pkg.mlp:MLP.forward' }, region_pct_device_time: 22, est_gain_pct_expected: 3 };
@@ -142,7 +145,7 @@ const answers = {
   // On AgentX the analyst also recommends c3, which has no seam: it gets no region UT.
   'fusion_analyst:analyze': () => (scenario === 'on_error' ? null : { topk_json: `${EV}/kernel_fusion/analysis/topk.json`,
     report_path: `${EV}/kernel_fusion/analysis/REPORT.md`, report_md: '# report', candidates: REGIONS,
-    recommended: [...(AGX ? ['c1', 'c2', 'c3'] : ['c1', 'c2']), ...(HEAD ? ['c4'] : [])] }),
+    recommended: [...(AGX ? ['c1', 'c2', 'c3'] : ['c1', 'c2']), ...(HEAD ? ['c4'] : [])], hotspots: HOTSPOTS }),
   // --- AgentX: one prepared single kernel; the recommended regions get their own region UT ---
   'kernel_extractor:prepare baseline': () => prepared('baseline', [['k_norm', 5, 'norm']], HEAD ? [AX_HEAD] : []),
   'kernel_extractor:prepare kf_c1': () => prepared('kf_c1', [['kf_c1', 4, 'fusion']]),

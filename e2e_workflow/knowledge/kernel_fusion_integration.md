@@ -27,9 +27,15 @@ The fusion work is two skills under `knowledge/kernel_fusion_skills/`:
   by one (the single-kernel route), and recommends only the regions where fusion is expected to win. A
   region with `route: "single_kernel"` is never prepared or routed as a region; its kernels stay ordinary
   kernel candidates.
-- **`fusion-kernel`** (authoring): what a kernel lane reads when it gets a FUSION REGION task. It tunes the
-  region's heavy member first, fuses the neighbours on top of it, and keeps the best of stock / tuned
-  member / tuned and fused at the region UT, guarded to its measured envelope.
+- **`co-optimization`** (method): the kernel-fusion co-optimization skill (`SKILL.md`, references `01`–`09`,
+  `tools/`) and `fusion_kernel_prompt.md` (prompt v2, its input slots mapped to what KernelFusion hands a
+  lane). Both the analysis (gain estimate) and the authoring follow it.
+- **`fusion-kernel`** (authoring): what a kernel lane reads when it gets a FUSION REGION task, after
+  `co-optimization/fusion_kernel_prompt.md` and `co-optimization/SKILL.md`. Steps 0–7 of the prompt: parity
+  floor `t_floor = min(chain, members tuned alone)` first, then budget, per-edge D0–D4 analysis, design
+  space, skeleton, parity before levers, fusion levers in rounds; done means `t_fused <= t_floor` on every
+  case, a losing case routes back (`support.json` refusals). It hands back `baseline.json`, `design.md`,
+  five-column per-case times in `ut_result.json` and one of three verdicts in `notes.md`.
 
 Every region, at any level and whoever implements it, uses one UT standard and one hand-back
 (`roles/_fragments/fusion_ut_contract.md`):
@@ -65,8 +71,11 @@ e2e_workflow/knowledge/kernel_fusion_skills/fusion-analysis/
                                                 (scripts/kf_trace_digest.py) and the digest's tests
 e2e_workflow/roles/_fragments/fusion_ut_contract.md
                                                 read by kernel_extractor (or the kernel-extract skill) for a region UT
+e2e_workflow/knowledge/kernel_fusion_skills/co-optimization/
+                                                the co-optimization skill and fusion_kernel_prompt.md (read by the
+                                                analysis for its gain estimate and by every fused-kernel lane)
 e2e_workflow/knowledge/kernel_fusion_skills/fusion-kernel/
-                                                the fusion-kernel skill (SKILL.md, references/: tune-then-fuse,
+                                                the fusion-kernel skill (SKILL.md, references/:
                                                 FlyDSL), read by the kernel_lane.js run that writes the fused kernel
 e2e_workflow/scripts/fusion_handback.py        assembles a region lane's hand-back and checks it against the region UT (run through one agent)
 e2e_workflow/scripts/fusion_overlay_check.py    the on-disk check of an accepted region's overlay (run through one agent)

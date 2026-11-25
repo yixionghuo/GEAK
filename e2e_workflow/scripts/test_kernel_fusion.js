@@ -60,6 +60,8 @@ const bareResult = (r) => {
   return o;
 };
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const HOT = [{ kernel: 'gemm_kernel', pct_gpu_time: 12, single_kernel_gain_pct_expected: 1.2, basis: 'untuned' },
+  { kernel: 'gemm_bf16_kernel', pct_gpu_time: 20, single_kernel_gain_pct_expected: 2.5, basis: 'tuned lib' }];
 
 console.log('## A. structure: no phase, hooks into the stages GEAK already has');
 const meta = (src.match(/phases:\s*\[[\s\S]*?\n {2}\],/) || [''])[0];
@@ -167,6 +169,23 @@ const lane = laneOf(on, 'kf_c2');
 ok(/kernel_workflow\/kernel_lane\.js$/.test(lane.script) && /^FUSION REGION c2 \(L1\): write ONE fused triton kernel/.test(lane.task) &&
   lane.task.includes('kernel_fusion_skills/fusion-kernel/SKILL.md') && lane.task.includes('one pass: normalize'),
   'the fused kernel is optimized by GEAK\'s kernel_lane.js with the region task and the fusion-kernel skill');
+const co = (f) => `kernel_fusion_skills/co-optimization/${f}`;
+ok(lane.task.indexOf(co('fusion_kernel_prompt.md')) >= 0 && lane.task.indexOf(co('fusion_kernel_prompt.md')) < lane.task.indexOf(co('SKILL.md')) &&
+  lane.task.indexOf(co('SKILL.md')) < lane.task.indexOf('fusion-kernel/SKILL.md') && lane.task.includes(`${WF_DIR}/knowledge/`) &&
+  lane.task.includes('"est_gain_pct_expected":1.5'),
+  'the lane reads the co-optimization prompt, then its SKILL.md, then the fusion-kernel skill (absolute paths)');
+const coDir = path.join(WF_DIR, 'knowledge', 'kernel_fusion_skills', 'co-optimization');
+const prm = fs.readFileSync(path.join(coDir, 'fusion_kernel_prompt.md'), 'utf8');
+const fks = fs.readFileSync(path.join(WF_DIR, 'knowledge', 'kernel_fusion_skills', 'fusion-kernel', 'SKILL.md'), 'utf8');
+ok(!/\{\{SKILL_DIR\}\}/.test(prm) && !/\{\{[^}]*\}\}/.test(prm.replace('`{{...}}`', '')) &&
+  ['meta.json', 'kernel_src/_handback/design.md', 'kernel_src/_handback/baseline.json', 'refusals', 'notes.md'].every((k) => prm.includes(k)) &&
+  ['SKILL.md', 'references/01_decide_and_order.md', 'references/09_mid_fusion_diagnosis.md', 'tools/region_stamp.h']
+    .every((f) => fs.existsSync(path.join(coDir, f))),
+  'co-optimization: the skill package is in place, the prompt\'s input slots and outputs are mapped onto GEAK\'s');
+ok(['t_fused <= t_floor', '§0.1', '§0.2', '`02`', '`04`', '`09`', 'five columns', 'one of three verdicts', 'not a reason to fuse',
+  'Parity before levers', 'baseline.json'].every((k) => fks.includes(k)) &&
+  !fs.existsSync(path.join(WF_DIR, 'knowledge', 'kernel_fusion_skills', 'fusion-kernel', 'references', 'tune-then-fuse.md')),
+  'fusion-kernel: steps 0-7 of the prompt (tune-then-fuse folded into step 0)');
 ok(fs.existsSync(path.join(WF_DIR, 'knowledge', 'kernel_fusion_skills', 'fusion-kernel', 'SKILL.md')) &&
   !fs.existsSync(path.join(WF_DIR, 'roles', '_fragments', 'fused_kernel_task.md')),
   'writing the fused kernel is a skill (fusion-kernel), not a prompt fragment');
@@ -272,10 +291,15 @@ const axr = run('on_agentx_route');
 ok(!labels(axr).includes('kernel_extractor:prepare kf_c1') && labels(axr).includes('kernel_extractor:prepare kf_c2') &&
   same(kfOf(axr).single_kernel_route, ['c1']) && !kfOf(axr).recommended.includes('c1') && !names(axr).includes('kf_c1'),
   'a region the analysis routes to single-kernel work is never prepared, routed or banked as a region');
+ok(same(kfOf(on).hotspots, HOT) && /hotspots: \{ type: 'array'/.test(src) && kfOf(axr).hotspots.length === 2,
+  'the analysis\' hotspots (every TopK single kernel\'s gain alone) are kept in the record');
 const fa = fs.readFileSync(path.join(WF_DIR, 'knowledge', 'kernel_fusion_skills', 'fusion-analysis', 'SKILL.md'), 'utf8');
 ok(/### Step 5 — Fusion against the single-kernel route/.test(fa) && /Recommend only candidates whose route is `fusion`/.test(fa) &&
   /route \("fusion" when est_gain_pct_expected is larger/.test(role),
   'the fusion-analysis skill compares each region with the single-kernel route; the analyst returns the route');
+ok(['~2 µs', '7 TB/s', 't_floor', 'D3', 'D4', 'Launch-only regions', 'Coverage', 'gain_basis', '07_kernel_to_e2e.md', 'Every single-kernel hotspot']
+  .every((k) => fa.includes(k)) && /"hotspots"/.test(role) && /gain_basis/.test(role) && /co-optimization/.test(role),
+  'gains are estimated by the co-optimization method; the analyst returns gain_basis and every TopK hotspot');
 
 console.log('\n## F. phase by phase: a resumed run keeps the fusion profile');
 const setup = run('on_setup');
