@@ -88,12 +88,17 @@ async function readPreparedDocument(root, delivery, deliveryPath) {
       // lanes exactly what passed the gate instead of a promise to re-read it later.
       candidate.prepared_ut = { phase: task.phase, result_path: resultPath,
         sha256: sha256(bytes), result };
-      // Existing optimization lanes lease one GPU. A validated multi-rank UT
-      // remains a deliverable, but cannot be dispatched to that single-card lane.
+      // Head/milestone lanes lease one GPU, except the lane of an L3 MegaKernel fusion region:
+      // e2e_workflow.js gives it gpu_ids = the region's group and gpus_per_job = required_gpu_count
+      // (kfLaneGpus). A validated multi-rank UT that declares mega and a GPU group of its rank count
+      // is dispatched to that lane; any other multi-rank UT remains a deferred deliverable.
       const gpuCount = kernel.required_gpu_count ?? result.required_gpu_count ??
         (candidate.op_kind === 'collective' ? 2 : 1);
       if (!Number.isInteger(gpuCount) || gpuCount < 1) throw new Error('invalid required_gpu_count');
-      if (gpuCount > 1) {
+      const group = String(kernel.gpu_group ?? '').split(',').map(id => id.trim()).filter(Boolean);
+      const megaLane = kernel.mega === true && gpuCount > 1 && new Set(group).size >= gpuCount;
+      if (megaLane) Object.assign(candidate, { required_gpu_count: gpuCount, gpu_group: group.join(',') });
+      if (gpuCount > 1 && !megaLane) {
         output.deferred_tasks.push({ ...candidate, task_dir: result.task_dir,
           result_path: resultPath, required_gpu_count: gpuCount,
           reason: 'UT validated; optimization requires a multi-GPU lane, current head/milestone lanes lease one GPU' });
