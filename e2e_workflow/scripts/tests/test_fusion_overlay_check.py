@@ -260,3 +260,52 @@ def test_validate_overlay_checks_the_manifest_by_key_like_overlay_merge(tmp_path
             assert check["ok"], (name, check["problems"])
         else:
             assert not check["ok"] and any(needle in p for p in check["problems"]), (name, check["problems"])
+
+
+def test_a_rebind_on_an_unchanged_function_of_a_replaced_module_may_stack(tmp_path, monkeypatch):
+    """The one allowed overlap: the initial overlay replaces module pkg.a, a stacked region rebinds pkg.a:X, and
+    X's definition in the patched file is AST-identical to the installed pkg.a's (DSv4.1: the draft rebind of
+    _forward_hc_pre_from_prev on the hc-patched module, whose copy of that function is the stock one). Any change
+    to X, a missing X, a rebind of another module, or an installed source that cannot be found stays a conflict."""
+    stock_src = ("def fn(x):\n    return x + 1\n\n\ndef helper(x):\n    return x * 2\n\n\n"
+                 "class C:\n    def m(self):\n        return 1\n\n    def n(self):\n        return 2\n")
+    # The patched module changes helper and C.n only; fn and C.m keep their stock definitions (comments and
+    # blank lines differ, which an AST comparison ignores).
+    patched_src = ("# patched by the hc region\ndef fn(x):\n    # same body\n    return x + 1\n\n"
+                   "def helper(x):\n    return x << 1\n\n"
+                   "class C:\n    def m(self):\n        return 1\n    def n(self):\n        return 3\n")
+    stock = tmp_path / "site_packages"
+    (stock / "pkg").mkdir(parents=True)
+    (stock / "pkg" / "__init__.py").write_text("")
+    (stock / "pkg" / "a.py").write_text(stock_src)
+    monkeypatch.syspath_prepend(str(stock))
+    empty = {"modules": [], "rebinds": [], "markers": [], "captures": []}
+    mod = {"module": "pkg.a", "file": "_patched/pkg.a.py"}
+    files = {"_patched/pkg.a.py": patched_src}
+
+    def stacked(target):
+        return ({**empty, "modules": [mod]},
+                {**empty, "modules": [mod], "rebinds": [{"target": target, "impl_module": "kf_impl", "impl_attr": "f"}]})
+
+    cases = {
+        "unchanged function": ("pkg.a:fn", None),
+        "unchanged method": ("pkg.a:C.m", None),
+        "changed function": ("pkg.a:helper", "the initial overlay changed helper"),
+        "changed method": ("pkg.a:C.n", "the initial overlay changed C.n"),
+        "missing attribute": ("pkg.a:nope", "nope is not defined in the patched pkg.a"),
+        "whole module rebind": ("pkg.a", "overlaps pkg.a"),
+    }
+    for name, (target, needle) in cases.items():
+        before, after = stacked(target)
+        check = _manifest_check(tmp_path, name.replace(" ", "_"), before, after, files)
+        if needle is None:
+            assert check["ok"], (name, check["problems"])
+        else:
+            assert not check["ok"] and any(needle in p for p in check["problems"]), (name, check["problems"])
+
+    # fail closed: without the installed source on sys.path the same unchanged function is a conflict again
+    monkeypatch.syspath_prepend(str(tmp_path / "empty"))
+    monkeypatch.setattr(sys, "path", [p for p in sys.path if p != str(stock)])
+    before, after = stacked("pkg.a:fn")
+    check = _manifest_check(tmp_path, "no_stock", before, after, files)
+    assert not check["ok"] and any("was not found on sys.path" in p for p in check["problems"]), check["problems"]

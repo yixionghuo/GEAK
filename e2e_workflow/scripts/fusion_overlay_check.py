@@ -17,7 +17,11 @@ runs this through one agent and banks the region only on "ok": true.
    stacking a region must add its own entries, so it is checked by key instead (every initial
    module / rebind / marker / capture / installer entry is kept unchanged and only once, and no new
    module, rebind or installer target overlaps an initial one -- the conflict rule of
-   overlay_setup.py merge), and every other initial field is unchanged;
+   overlay_setup.py merge), and every other initial field is unchanged. One overlap is allowed: a new
+   rebind of <module>:<attr> on a module the initial overlay replaces, when <attr>'s definition in that
+   patched file is AST-identical to the installed module's (the rebind then replaces nothing the initial
+   overlay changed). The installed source is found on sys.path without importing anything; when it
+   cannot be found or parsed, or <attr> is missing on either side, the overlap is still a conflict;
 5. it is the overlay the A/B measured: an integrate_result.json accepted exactly this directory with a
    complete A/B, and no code in it (_CODE_SUFFIXES) changed after that A/B's candidate leg finished. The
    A/B's own records (e2e_validation.json, manifests.json, ...) land here after the A/B and are not
@@ -26,6 +30,7 @@ runs this through one agent and banks the region only on "ok": true.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import importlib.util
 import json
@@ -83,6 +88,57 @@ def _sites(kind: str, entry: dict) -> list[str]:
     return [key] if kind in ("modules", "rebinds") and isinstance(key, str) else []
 
 
+def _definition(source: str, attr: str) -> str | None:
+    """ast.dump of the last top-level (or Class.member) definition named by attr, or None."""
+    body = ast.parse(source).body
+    node = None
+    for part in attr.split("."):
+        node = None
+        for n in body:   # the last binding wins, as it does at import time
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == part:
+                node = n
+            elif isinstance(n, (ast.Assign, ast.AnnAssign)):
+                names = n.targets if isinstance(n, ast.Assign) else [n.target]
+                if any(isinstance(t, ast.Name) and t.id == part for t in names):
+                    node = n
+        if node is None:
+            return None
+        body = node.body if isinstance(node, ast.ClassDef) else []
+    return ast.dump(node, include_attributes=False)
+
+
+def _installed_source(module: str, exclude: list[Path]) -> Path | None:
+    """The installed file of a dotted module, found on sys.path WITHOUT importing it (or its parents),
+    skipping the overlay dirs themselves."""
+    parts = module.split(".")
+    for entry in sys.path:
+        base = Path(entry or ".").resolve()
+        if any(base == x or x in base.parents for x in exclude):
+            continue
+        for cand in (base.joinpath(*parts).with_suffix(".py"), base.joinpath(*parts, "__init__.py")):
+            if cand.is_file():
+                return cand
+    return None
+
+
+def _unchanged_rebind_site(target: str, module_entry: dict, root: Path, exclude: list[Path]) -> str:
+    """'' when a rebind of target replaces only code the initial patched module left as installed, else why not."""
+    module, _, attr = target.partition(":")
+    if not attr or module != module_entry.get("module"):
+        return "it is not an attribute of the replaced module itself"
+    stock = _installed_source(module, exclude)
+    if stock is None:
+        return f"the installed {module} source was not found on sys.path"
+    try:
+        mine = _definition((root / str(module_entry.get("file") or "")).read_text(encoding="utf-8"), attr)
+        theirs = _definition(stock.read_text(encoding="utf-8"), attr)
+    except (OSError, UnicodeDecodeError, SyntaxError, ValueError) as e:
+        return f"cannot compare {attr}: {type(e).__name__}"
+    if mine is None or theirs is None:
+        return f"{attr} is not defined in {'the patched' if mine is None else 'the installed'} {module}"
+    return "" if mine == theirs else f"the initial overlay changed {attr} in {module}"
+
+
 def _manifest_superset_problems(new_p: Path, old_p: Path, root: Path) -> list[str]:
     """Problems if the new manifest drops, alters, duplicates or overrides an entry of the initial one."""
     old, new = _read_json(old_p), _read_json(new_p)
@@ -91,10 +147,11 @@ def _manifest_superset_problems(new_p: Path, old_p: Path, root: Path) -> list[st
     if new is None:
         return [f"{_MANIFEST} is not a JSON object"]
     out: list[str] = []
+    exclude = [root.resolve(), new_p.parent.resolve()]
     for key, val in old.items():
         if key not in _MANIFEST_KEYS and new.get(key) != val:
             out.append(f"{_MANIFEST}: initial field '{key}' ({root}) was changed")
-    held: list[tuple[str, str]] = []   # (site, "kind:key") of every initial entry
+    held: list[tuple[str, str, str, dict]] = []   # (site, kind, key, entry) of every initial entry
     for kind, ident in _MANIFEST_KEYS.items():
         before, after = old.get(kind, []), new.get(kind, [])
         if not isinstance(before, list):
@@ -112,17 +169,22 @@ def _manifest_superset_problems(new_p: Path, old_p: Path, root: Path) -> list[st
                 out.append(f"{_MANIFEST}: initial '{kind}' entry {k!r} ({root}) has another entry with the same "
                            f"{ident}, which replaces it at load time")
             if isinstance(e, dict):
-                held += [(s, f"{kind}:{k}") for s in _sites(kind, e)]
+                held += [(s, kind, k, e) for s in _sites(kind, e)]
     for kind, ident in _MANIFEST_KEYS.items():
         after = new.get(kind, [])
         for e in after if isinstance(after, list) else []:
             if not isinstance(e, dict) or e in (old.get(kind) or []):
                 continue
             for site in _sites(kind, e):
-                for prev, owner in held:
-                    if _targets_overlap(site, prev):
-                        out.append(f"{_MANIFEST}: new '{kind}' entry {e.get(ident)!r} targets {site}, which overlaps "
-                                   f"{prev} of the initial {owner} ({root})")
+                for prev, pkind, pkey, pentry in held:
+                    if not _targets_overlap(site, prev):
+                        continue
+                    why = (_unchanged_rebind_site(site, pentry, root, exclude) if kind == "rebinds" and pkind == "modules"
+                           else "")
+                    if kind == "rebinds" and pkind == "modules" and not why:
+                        continue
+                    out.append(f"{_MANIFEST}: new '{kind}' entry {e.get(ident)!r} targets {site}, which overlaps "
+                               f"{prev} of the initial {pkind}:{pkey} ({root})" + (f": {why}" if why else ""))
     return out
 
 
