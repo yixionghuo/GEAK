@@ -20,8 +20,11 @@ runs this through one agent and banks the region only on "ok": true.
    overlay_setup.py merge), and every other initial field is unchanged. One overlap is allowed: a new
    rebind of <module>:<attr> on a module the initial overlay replaces, when <attr>'s definition in that
    patched file is AST-identical to the installed module's (the rebind then replaces nothing the initial
-   overlay changed). The installed source is found on sys.path without importing anything; when it
-   cannot be found or parsed, or <attr> is missing on either side, the overlap is still a conflict;
+   overlay changed): every binding of it in its scope, including nested blocks, imports and module-level
+   writes such as C.m = ... or setattr(C, "m", ...), is compared. The installed source is located without
+   importing anything (the top-level package's spec, which an editable install's finder resolves, then
+   sys.path); when it cannot be found or parsed, or <attr> is missing on either side, the overlap is still a
+   conflict;
 5. it is the overlay the A/B measured: an integrate_result.json accepted exactly this directory with a
    complete A/B, and no code in it (_CODE_SUFFIXES) changed after that A/B's candidate leg finished. The
    A/B's own records (e2e_validation.json, manifests.json, ...) land here after the A/B and are not
@@ -88,32 +91,127 @@ def _sites(kind: str, entry: dict) -> list[str]:
     return [key] if kind in ("modules", "rebinds") and isinstance(key, str) else []
 
 
-def _definition(source: str, attr: str) -> str | None:
-    """ast.dump of the last top-level (or Class.member) definition named by attr, or None."""
-    body = ast.parse(source).body
-    node = None
-    for part in attr.split("."):
-        node = None
-        for n in body:   # the last binding wins, as it does at import time
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == part:
-                node = n
-            elif isinstance(n, (ast.Assign, ast.AnnAssign)):
-                names = n.targets if isinstance(n, ast.Assign) else [n.target]
-                if any(isinstance(t, ast.Name) and t.id == part for t in names):
-                    node = n
-        if node is None:
+_SCOPES = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try) + (
+    (ast.TryStar,) if hasattr(ast, "TryStar") else ())
+
+
+def _scope(body: list) -> list:
+    """Every statement of one scope, including those nested in if / for / while / with / try blocks (which
+    run in the same scope), but not inside a function or class body."""
+    out = []
+    for n in body:
+        out.append(n)
+        if isinstance(n, _SCOPES):
+            for field in ("body", "orelse", "finalbody"):
+                out += _scope(getattr(n, field, []) or [])
+            for h in getattr(n, "handlers", []) or []:
+                out += _scope(h.body)
+    return out
+
+
+def _names(target) -> list[str]:
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [x for e in target.elts for x in _names(e)]
+    return []
+
+
+def _binds(n, name: str) -> bool:
+    """Whether statement n binds name in its own scope."""
+    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return n.name == name
+    if isinstance(n, ast.Assign):
+        return any(name in _names(t) for t in n.targets)
+    if isinstance(n, (ast.AnnAssign, ast.AugAssign)):
+        return name in _names(n.target)
+    if isinstance(n, (ast.Import, ast.ImportFrom)):
+        return any((al.asname or al.name.split(".")[0]) == name for al in n.names)
+    return False
+
+
+def _dotted(e) -> str | None:
+    if isinstance(e, ast.Name):
+        return e.id
+    if isinstance(e, ast.Attribute):
+        base = _dotted(e.value)
+        return base and f"{base}.{e.attr}"
+    return None
+
+
+def _attr_writes(body: list, attr: str) -> list:
+    """Module-scope statements that write the dotted attribute from outside its class: C.m = ... (+= / :),
+    setattr(C, "m", ...) and delattr(C, "m")."""
+    owner, _, last = attr.rpartition(".")
+    out = []
+    for n in _scope(body):
+        targets = n.targets if isinstance(n, ast.Assign) else (
+            [n.target] if isinstance(n, (ast.AnnAssign, ast.AugAssign)) else [])
+        if any(_dotted(t) == attr for t in targets):
+            out.append(n)
+        elif (isinstance(n, ast.Expr) and isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Name)
+              and n.value.func.id in ("setattr", "delattr") and len(n.value.args) >= 2
+              and _dotted(n.value.args[0]) == owner and isinstance(n.value.args[1], ast.Constant)
+              and n.value.args[1].value == last):
+            out.append(n)
+    return out
+
+
+def _definition(source: str, attr: str) -> list[str] | None:
+    """What decides attr (a name or Class.member) at import time, as ast dumps: every binding of each part in
+    its scope (nested if / try / ... blocks and imports included) and, for a member, every module-scope write
+    of it from outside the class. None when attr is not bound."""
+    mod = ast.parse(source)
+    parts, body, sig = attr.split("."), mod.body, []
+    for i, part in enumerate(parts):
+        nodes = [n for n in _scope(body) if _binds(n, part)]
+        if not nodes:
             return None
-        body = node.body if isinstance(node, ast.ClassDef) else []
-    return ast.dump(node, include_attributes=False)
+        last = nodes[-1]
+        if i == len(parts) - 1:
+            sig += [ast.dump(n, include_attributes=False) for n in nodes]
+        elif isinstance(last, ast.ClassDef) and len(nodes) == 1:
+            body = last.body
+        else:   # the class is rebound or redefined: compare every binding of it, member lookup is undecidable
+            return sig + [ast.dump(n, include_attributes=False) for n in nodes]
+    if len(parts) > 1:
+        sig += [ast.dump(n, include_attributes=False) for n in _attr_writes(mod.body, attr)]
+    return sig
 
 
 def _installed_source(module: str, exclude: list[Path]) -> Path | None:
-    """The installed file of a dotted module, found on sys.path WITHOUT importing it (or its parents),
-    skipping the overlay dirs themselves."""
+    """The installed file of a dotted module, found WITHOUT importing it or its parents: the top-level
+    package's spec (importlib.util.find_spec(<top>) goes through every sys.meta_path finder, including a
+    PEP 660 editable-install finder, and imports nothing for a top-level name), then the remaining parts under
+    its submodule_search_locations; else a plain sys.path scan. Overlay dirs are skipped."""
     parts = module.split(".")
+    skip = lambda p: any(p == x or x in p.parents for x in exclude)
+
+    def under(bases):
+        for base in bases:
+            base = Path(base).resolve()
+            if skip(base):
+                continue
+            for cand in (base.joinpath(*parts[1:]).with_suffix(".py") if parts[1:] else None,
+                         base.joinpath(*parts[1:], "__init__.py")):
+                if cand is not None and cand.is_file():
+                    return cand
+        return None
+
+    try:
+        spec = importlib.util.find_spec(parts[0])
+    except (ImportError, ValueError, AttributeError):
+        spec = None
+    if spec is not None:
+        if spec.submodule_search_locations:
+            hit = under(list(spec.submodule_search_locations))
+            if hit:
+                return hit
+        elif len(parts) == 1 and spec.origin and Path(spec.origin).is_file() and not skip(Path(spec.origin).resolve()):
+            return Path(spec.origin)
     for entry in sys.path:
         base = Path(entry or ".").resolve()
-        if any(base == x or x in base.parents for x in exclude):
+        if skip(base):
             continue
         for cand in (base.joinpath(*parts).with_suffix(".py"), base.joinpath(*parts, "__init__.py")):
             if cand.is_file():

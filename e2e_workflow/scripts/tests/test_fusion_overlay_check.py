@@ -309,3 +309,73 @@ def test_a_rebind_on_an_unchanged_function_of_a_replaced_module_may_stack(tmp_pa
     before, after = stacked("pkg.a:fn")
     check = _manifest_check(tmp_path, "no_stock", before, after, files)
     assert not check["ok"] and any("was not found on sys.path" in p for p in check["problems"]), check["problems"]
+
+
+def test_the_installed_source_is_found_through_an_editable_install_finder(tmp_path, monkeypatch):
+    """A PEP 660 editable install (sglang in the serving images) is resolved by a sys.meta_path finder, not a
+    sys.path entry. The lookup goes through the top-level package's spec, so it finds the source there -- and
+    imports nothing (the package stays out of sys.modules)."""
+    import importlib.abc
+    import importlib.machinery
+    src = tmp_path / "workspace" / "edpkg"
+    (src / "sub").mkdir(parents=True)
+    (src / "__init__.py").write_text("raise RuntimeError('importing edpkg is not allowed here')\n")
+    (src / "sub" / "__init__.py").write_text("")
+    (src / "sub" / "mod.py").write_text("def fn(x):\n    return x\n\n\ndef g(x):\n    return 1\n")
+
+    class EditableFinder(importlib.abc.MetaPathFinder):
+        def find_spec(self, name, path=None, target=None):
+            if name != "edpkg":
+                return None
+            return importlib.util.spec_from_file_location(name, src / "__init__.py",
+                                                          submodule_search_locations=[str(src)])
+
+    monkeypatch.setattr(sys, "meta_path", sys.meta_path + [EditableFinder()])
+    assert foc._installed_source("edpkg.sub.mod", []) == src / "sub" / "mod.py"
+    assert "edpkg" not in sys.modules
+    empty = {"modules": [], "rebinds": [], "markers": [], "captures": []}
+    mod = {"module": "edpkg.sub.mod", "file": "_patched/edpkg.sub.mod.py"}
+    patched = "def fn(x):\n    return x\n\n\ndef g(x):\n    return 2\n"
+    for target, ok in (("edpkg.sub.mod:fn", True), ("edpkg.sub.mod:g", False)):
+        check = _manifest_check(tmp_path, target.replace(":", "_"), {**empty, "modules": [mod]},
+                                {**empty, "modules": [mod],
+                                 "rebinds": [{"target": target, "impl_module": "kf_impl", "impl_attr": "f"}]},
+                                {"_patched/edpkg.sub.mod.py": patched})
+        assert check["ok"] is ok, (target, check["problems"])
+    assert "edpkg" not in sys.modules
+
+
+def test_a_definition_counts_every_binding_that_decides_it_at_import_time(tmp_path, monkeypatch):
+    """The patched module can change a function without touching its def: a module-level write of the member
+    (C.m = ..., setattr(C, "m", ...)), a redefinition inside an if / try block, or an import that rebinds the
+    name. Each of these is a change, so the rebind on it stays a conflict."""
+    stock_src = "class C:\n    def m(self):\n        return 1\n\n\ndef fn(x):\n    return x\n"
+    stock = tmp_path / "site_packages"
+    (stock / "pkg2").mkdir(parents=True)
+    (stock / "pkg2" / "__init__.py").write_text("")
+    (stock / "pkg2" / "b.py").write_text(stock_src)
+    monkeypatch.syspath_prepend(str(stock))
+    empty = {"modules": [], "rebinds": [], "markers": [], "captures": []}
+    mod = {"module": "pkg2.b", "file": "_patched/pkg2.b.py"}
+    variants = {
+        "class attribute assigned at module level": ("pkg2.b:C.m", stock_src + "\n\ndef _m2(self):\n    return 2\n\n\nC.m = _m2\n"),
+        "setattr at module level": ("pkg2.b:C.m", stock_src + "\nsetattr(C, 'm', lambda self: 2)\n"),
+        "redefinition in an if block": ("pkg2.b:fn", stock_src + "\nif True:\n    def fn(x):\n        return -x\n"),
+        "rebinding import": ("pkg2.b:fn", stock_src + "\nfrom os.path import basename as fn\n"),
+        "class redefined": ("pkg2.b:C.m", stock_src + "\nclass C:\n    def m(self):\n        return 1\n"),
+    }
+    for name, (target, patched) in variants.items():
+        check = _manifest_check(tmp_path, name.replace(" ", "_"), {**empty, "modules": [mod]},
+                                {**empty, "modules": [mod],
+                                 "rebinds": [{"target": target, "impl_module": "kf_impl", "impl_attr": "f"}]},
+                                {"_patched/pkg2.b.py": patched})
+        assert not check["ok"] and any("the initial overlay changed" in p for p in check["problems"]), \
+            (name, check["problems"])
+    # the same statements in BOTH the installed and the patched module are not a change
+    same = stock_src + "\nsetattr(C, 'm', lambda self: 2)\n"
+    (stock / "pkg2" / "b.py").write_text(same)
+    check = _manifest_check(tmp_path, "same_in_both", {**empty, "modules": [mod]},
+                            {**empty, "modules": [mod],
+                             "rebinds": [{"target": "pkg2.b:C.m", "impl_module": "kf_impl", "impl_attr": "f"}]},
+                            {"_patched/pkg2.b.py": same})
+    assert check["ok"], check["problems"]
