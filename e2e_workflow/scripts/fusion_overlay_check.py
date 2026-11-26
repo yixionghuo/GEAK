@@ -13,7 +13,11 @@ runs this through one agent and banks the region only on "ok": true.
 3. every absolute path it names under the run's parent dir (the fused kernels it loads) exists;
 4. existing optimizations are kept: every file of the initial overlay is present and byte-identical,
    and the initial sitecustomize.py is either kept as is or copied under another name that the new
-   sitecustomize.py imports;
+   sitecustomize.py imports. The merged injection manifest (_overlay_manifest.json) is the one exception:
+   stacking a region must add its own entries, so it is checked by key instead (every initial
+   module / rebind / marker / capture / installer entry is kept unchanged and only once, and no new
+   module, rebind or installer target overlaps an initial one -- the conflict rule of
+   overlay_setup.py merge), and every other initial field is unchanged;
 5. it is the overlay the A/B measured: an integrate_result.json accepted exactly this directory with a
    complete A/B, and no code in it (_CODE_SUFFIXES) changed after that A/B's candidate leg finished. The
    A/B's own records (e2e_validation.json, manifests.json, ...) land here after the A/B and are not
@@ -23,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -49,14 +54,37 @@ def _read_json(p: Path) -> dict | None:
 
 
 # The overlay's merged injection manifest (read by sitecustomize.py). Stacking a region on an accepted
-# overlay must ADD its own module/rebind/marker/capture entries here, so this file can never stay
-# byte-identical; it is checked as a superset instead.
+# overlay must ADD its own entries here, so this file can never stay byte-identical; it is checked by key
+# instead, with the same identity keys and target-overlap rule as overlay_setup.py merge.
 _MANIFEST = "_overlay_manifest.json"
-_MANIFEST_LISTS = ("modules", "rebinds", "markers", "captures")
+_MANIFEST_KEYS = {"modules": "module", "rebinds": "target", "markers": "target", "captures": "target",
+                  "installers": "id"}
+
+
+_OVERLAY_SETUP = None
+
+
+def _targets_overlap(left: str, right: str) -> bool:
+    """overlay_setup.py's rule: one target replaces (part of) the other ("pkg.mod" covers "pkg.mod:fn")."""
+    global _OVERLAY_SETUP
+    if _OVERLAY_SETUP is None:
+        spec = importlib.util.spec_from_file_location("_geak_overlay_setup",
+                                                      Path(__file__).with_name("overlay_setup.py"))
+        _OVERLAY_SETUP = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_OVERLAY_SETUP)
+    return _OVERLAY_SETUP._targets_overlap(left, right)
+
+
+def _sites(kind: str, entry: dict) -> list[str]:
+    """The serving sites an entry replaces: a module or rebind target, an installer's declared targets."""
+    if kind == "installers":
+        return [t for t in entry.get("targets") or [] if isinstance(t, str)]
+    key = entry.get(_MANIFEST_KEYS[kind])
+    return [key] if kind in ("modules", "rebinds") and isinstance(key, str) else []
 
 
 def _manifest_superset_problems(new_p: Path, old_p: Path, root: Path) -> list[str]:
-    """Problems if the new manifest drops or alters any entry of the initial one ([] = superset)."""
+    """Problems if the new manifest drops, alters, duplicates or overrides an entry of the initial one."""
     old, new = _read_json(old_p), _read_json(new_p)
     if old is None:
         return [f"initial {_MANIFEST} ({root}) is not a JSON object"]
@@ -64,17 +92,37 @@ def _manifest_superset_problems(new_p: Path, old_p: Path, root: Path) -> list[st
         return [f"{_MANIFEST} is not a JSON object"]
     out: list[str] = []
     for key, val in old.items():
-        if key in _MANIFEST_LISTS:
-            have = new.get(key)
-            if not isinstance(val, list) or not isinstance(have, list):
-                out.append(f"{_MANIFEST}: '{key}' is not a list")
-                continue
-            missing = [e for e in val if e not in have]
-            if missing:
-                out.append(f"{_MANIFEST}: initial '{key}' entries dropped or altered ({root}): "
-                           f"{json.dumps(missing)[:200]}")
-        elif new.get(key) != val:
+        if key not in _MANIFEST_KEYS and new.get(key) != val:
             out.append(f"{_MANIFEST}: initial field '{key}' ({root}) was changed")
+    held: list[tuple[str, str]] = []   # (site, "kind:key") of every initial entry
+    for kind, ident in _MANIFEST_KEYS.items():
+        before, after = old.get(kind, []), new.get(kind, [])
+        if not isinstance(before, list):
+            out.append(f"initial {_MANIFEST} ({root}): '{kind}' is not a list")
+            continue
+        if not isinstance(after, list):
+            out.append(f"{_MANIFEST}: '{kind}' is not a list")
+            continue
+        for e in before:
+            k = e.get(ident) if isinstance(e, dict) else None
+            same = [x for x in after if isinstance(x, dict) and x.get(ident) == k]
+            if e not in after:
+                out.append(f"{_MANIFEST}: initial '{kind}' entry dropped or altered ({root}): {json.dumps(e)[:200]}")
+            elif len(same) > 1:
+                out.append(f"{_MANIFEST}: initial '{kind}' entry {k!r} ({root}) has another entry with the same "
+                           f"{ident}, which replaces it at load time")
+            if isinstance(e, dict):
+                held += [(s, f"{kind}:{k}") for s in _sites(kind, e)]
+    for kind, ident in _MANIFEST_KEYS.items():
+        after = new.get(kind, [])
+        for e in after if isinstance(after, list) else []:
+            if not isinstance(e, dict) or e in (old.get(kind) or []):
+                continue
+            for site in _sites(kind, e):
+                for prev, owner in held:
+                    if _targets_overlap(site, prev):
+                        out.append(f"{_MANIFEST}: new '{kind}' entry {e.get(ident)!r} targets {site}, which overlaps "
+                                   f"{prev} of the initial {owner} ({root})")
     return out
 
 

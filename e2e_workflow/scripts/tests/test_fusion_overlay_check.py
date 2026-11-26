@@ -183,7 +183,7 @@ def test_validate_overlay_checks_the_merged_injection_manifest_as_a_superset(tmp
                            kf["file"]: "K = 1\n"}, "dropped or altered"),
         "altered entry": ({"_overlay_manifest.json": manifest([{**woa, "file": kf["file"]}, kf]),
                            woa["file"]: patched_woa, kf["file"]: "K = 1\n"}, "dropped or altered"),
-        "changed field": ({"_overlay_manifest.json": manifest([woa, kf], version=2), woa["file"]: patched_woa,
+        "added field": ({"_overlay_manifest.json": manifest([woa, kf], version=2), woa["file"]: patched_woa,
                            kf["file"]: "K = 1\n"}, None),
         "changed patched module": ({"_overlay_manifest.json": manifest([woa, kf]), woa["file"]: "W = 2\n",
                                     kf["file"]: "K = 1\n"}, "was changed"),
@@ -206,3 +206,57 @@ def test_validate_overlay_checks_the_merged_injection_manifest_as_a_superset(tmp
     init = _initial(root, {**init_files, "_overlay_manifest.json": manifest([woa], version=1)})
     check = foc.validate_overlay(ov, init, run_dir)
     assert not check["ok"] and any("'version'" in p for p in check["problems"]), check["problems"]
+
+
+def _manifest_check(tmp_path, name, init_manifest, new_manifest, files=None):
+    """validate_overlay on an overlay whose only manifest change is init_manifest -> new_manifest."""
+    site = "import json, os\n"
+    files = files or {}
+    root = tmp_path / name
+    run_dir = root / "e2e_x"
+    ov = make_overlay(run_dir, initial={"_overlay_manifest.json": json.dumps(new_manifest), **files}, site=site)
+    init = _initial(root, {"sitecustomize.py": site, "_overlay_manifest.json": json.dumps(init_manifest), **files})
+    return foc.validate_overlay(ov, init, run_dir)
+
+
+def test_validate_overlay_checks_the_manifest_by_key_like_overlay_merge(tmp_path):
+    """The manifest is checked with overlay_setup.py merge's identity keys and target-overlap rule: a stacked
+    region may add installers (they are list entries, not a field that must stay equal), but it may not keep an
+    initial entry while adding another one with the same key (sitecustomize loads the later one), nor target a
+    site an initial entry already replaces (a rebind runs after module injection and overrides the patch)."""
+    empty = {"modules": [], "rebinds": [], "markers": [], "captures": []}
+    mod = {"module": "pkg.a", "file": "_patched/pkg.a.py"}
+    files = {"_patched/pkg.a.py": "A = 1\n", "_patched/pkg.a2.py": "A = 2\n"}
+
+    def inst(i, targets=()):
+        return {"id": i, "module": f"inst_{i}", "callable": "install", "required": True,
+                "targets": list(targets), "kernels": []}
+
+    rb = {"target": "pkg.b:fn", "impl_module": "kf_impl", "impl_attr": "fn"}
+    cases = {
+        "installer stacked on installer": ({**empty, "installers": [inst("a", ["pkg.c:f"])]},
+                                           {**empty, "installers": [inst("a", ["pkg.c:f"]), inst("b", ["pkg.d:g"])]},
+                                           None),
+        "entries reordered": ({**empty, "rebinds": [rb, {**rb, "target": "pkg.b:gn"}]},
+                              {**empty, "rebinds": [{**rb, "target": "pkg.b:gn"}, rb]}, None),
+        "installer dropped": ({**empty, "installers": [inst("a")]}, {**empty, "installers": []}, "dropped or altered"),
+        "same module twice": ({**empty, "modules": [mod]},
+                              {**empty, "modules": [mod, {"module": "pkg.a", "file": "_patched/pkg.a2.py"}]},
+                              "same module"),
+        "rebind inside a replaced module": ({**empty, "modules": [mod]},
+                                            {**empty, "modules": [mod], "rebinds": [{**rb, "target": "pkg.a:fn"}]},
+                                            "overlaps pkg.a"),
+        "module over a rebind": ({**empty, "rebinds": [rb]},
+                                 {**empty, "rebinds": [rb], "modules": [{"module": "pkg.b", "file": "_patched/pkg.a2.py"}]},
+                                 "overlaps pkg.b:fn"),
+        "installer target over a rebind": ({**empty, "rebinds": [rb]},
+                                           {**empty, "rebinds": [rb], "installers": [inst("b", ["pkg.b:fn"])]},
+                                           "overlaps pkg.b:fn"),
+        "list on one side only": ({**empty, "rebinds": [rb]}, {**empty, "rebinds": {"x": 1}}, "'rebinds' is not a list"),
+    }
+    for name, (before, after, needle) in cases.items():
+        check = _manifest_check(tmp_path, name.replace(" ", "_"), before, after, files)
+        if needle is None:
+            assert check["ok"], (name, check["problems"])
+        else:
+            assert not check["ok"] and any(needle in p for p in check["problems"]), (name, check["problems"])
