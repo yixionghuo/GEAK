@@ -258,3 +258,23 @@ test('completed multi-rank UTs retain evidence but do not enter single-GPU optim
     assert.equal(task.prepared_ut.result.unittest_smoke, 'pass', 'deferred tasks keep their evidence');
   }
 });
+
+test('a validated L3 MegaKernel UT with its GPU group enters the multi-GPU fusion lane queue', async t => {
+  const f = await delivered(t);
+  await f.write('run/requested_kernel.json', {...f.kernel, op_kind: 'collective', mega: true,
+    required_gpu_count: 4, gpu_group: '0,1,2,3'});
+  await f.pack();
+  let queues = await readPreparedKernels(f.evalDir, 'delivery.json');
+  assert.deepEqual(queues.deferred_tasks, f.manifest.deferred_tasks);
+  assert.equal(queues.kernel_candidates.length, 1);
+  assert.equal(queues.kernel_candidates[0].required_gpu_count, 4);
+  assert.equal(queues.kernel_candidates[0].gpu_group, '0,1,2,3');
+  for (const declaration of [{gpu_group: '0,1'}, {mega: false}]) {
+    await f.write('run/requested_kernel.json', {...f.kernel, op_kind: 'collective', mega: true,
+      required_gpu_count: 4, gpu_group: '0,1,2,3', ...declaration});
+    await f.pack();
+    queues = await readPreparedKernels(f.evalDir, 'delivery.json');
+    assert.equal(queues.kernel_candidates.length, 0);
+    assert.match(queues.deferred_tasks.at(-1).reason, /multi-GPU lane/);
+  }
+});
