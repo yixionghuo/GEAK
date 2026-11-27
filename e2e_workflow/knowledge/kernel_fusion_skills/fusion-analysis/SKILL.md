@@ -19,6 +19,27 @@ every kernel pair that could be fused. Base each decision on:
 **Core principle: use the smallest fusion scope that removes the dominant bottleneck, and confirm the
 choice with measured performance.** A larger fusion scope is not better by itself.
 
+Six rules hold for every model, deployment and workload; each later step applies them:
+
+1. **Model the metric's response before the gain.** The unit of every gain is the target metric, not device
+   time. First establish how the target metric responds when each step kind gets faster (Step 1, Metric
+   response), then estimate candidates.
+2. **Split every gain into shared and fusion-only.** A gain either route can reach (tuning the region's heavy
+   member alone) is shared; the route decision uses only the fusion-only gain (absorbed light kernels,
+   intermediates kept off HBM, communication or waits hidden under independent compute, one read shared by
+   several consumers).
+3. **Baseline before fusion.** A fused kernel is compared with the split chain whose members are each at their
+   best (`t_floor`), never with the stock chain. A member that can be optimized alone is optimized first, and the
+   fusion is built on top of it.
+4. **Three verdicts, per shape.** For every served M (or bucket) the verdict is `fusion`, `single_kernel` or
+   `measure`; "leans fusion" is not a verdict. One region may take different routes at different M (a
+   host-side shape branch that graph capture accepts).
+5. **Intervals, against the noise.** Every number has a lower bound, an expected value and an upper bound, with
+   its basis, and is read against the run's A/B noise floor: a candidate below it cannot be confirmed on its own.
+6. **Calibrate on what was measured.** Completed A/Bs of this run (and records of the same deployment and
+   workload) are calibration data: the deviation between the estimate and the measurement is reported and
+   used for the remaining candidates.
+
 This skill is the analysis half of a search loop: trace → candidate generation → dependency validation
 → kernel implementation → microbenchmark → e2e benchmark → feedback → revised fusion pattern. Its
 output feeds the implementation and measurement steps; measured results, not this analysis, decide
@@ -100,6 +121,33 @@ part repeated per layer from the part executed once per step.
 Classify the workload as low concurrency (latency-sensitive), medium concurrency, or high concurrency
 (throughput-oriented). Concurrency alone does not determine the fusion level.
 
+#### Metric response
+
+A step that gets x% faster moves the target metric by an amount that depends on the step kind and on the
+metric, not by the step's device-time share. Before Step 3, build one row per step kind (every prefill/extend
+chunk size bucket, decode, target verify, draft):
+
+| Column | Meaning | Source |
+|---|---|---|
+| device share | the step kind's share of GPU time in the served workload | workload summary, trace |
+| duration distribution | p50 / p90 of one step of this kind | trace, server log |
+| tail exposure | the share of decode token gaps that contain a step of this kind, overall and near the target percentile | server log step timeline (how decode iterations and prefill/extend chunks interleave), or the trace's step order |
+| queue exposure | whether this step kind is on the path a new request waits on (admission, TTFT) | scheduler log: running / queued counts, TTFT distribution |
+| sensitivity `s_k` | % change of the target metric per 1% shorter step of this kind | computed as below |
+
+Compute `s_k`, never assume it:
+
+- **Tail metrics** (P90 ITL, interactivity = 1 / ITL percentile, tail TTFT): replay the logged token-gap
+  sequence offline with the gaps that contain step kind k shortened, and recompute the percentile. This is a
+  trace-level what-if; it needs no GPU. Under mixed scheduling (chunked prefill, speculative steps, mixed
+  batches) the longest step kinds usually weigh far more in the tail than their device share.
+- **Throughput and mean latency:** a fixed-concurrency trace replay (AgentX) fixes the offered work; throughput
+  rises only when requests queue or when conversations progress further within the fixed window. Decide from
+  the scheduler log whether the server is saturated; if it is, convert the critical-path saving; if not, the
+  throughput sensitivity is ~0 and the gain shows in latency metrics only.
+- When the logs needed are missing, record `s_k` as unknown and list it under missing information. **Do not
+  substitute the device share.** A candidate whose gain depends on an unknown `s_k` is `measure`.
+
 ### Step 2 — Execution regions
 
 Group kernels into logical regions using the trace and the source, for example: normalization,
@@ -161,7 +209,14 @@ Record for each candidate:
   and an expected value;
 - implementation difficulty (1–5);
 - whether the result can be bit-identical to the original;
-- relation to other candidates: exclusive (covers the same kernels) or stackable.
+- relation to other candidates: exclusive (covers the same kernels) or stackable;
+- `step_deltas`: the expected time saved per step kind and M bucket (not only one region speedup), the input of
+  the serving-layer conversion (Estimation);
+- `shared_gain` and `fusion_only_gain`, separately (Step 5);
+- `per_m_route`: the verdict per served M bucket (`fusion` / `single_kernel` / `measure`) and its basis;
+- `composes_with`: single-kernel candidates it can stack on (typically an independent candidate for the
+  region's heavy member) and what stacking needs (files or seams to merge); a fused candidate that would drop
+  such a member's optimization says so.
 
 When an obstacle appears ("needs a global synchronization", "already a fused kernel", "spans several
 modules"), look for a workaround first: redundant computation, a common enclosing seam, or absorption
@@ -182,9 +237,24 @@ weights, and keep the fusion only when it is expected to win. The method is the 
   untuned path at small M often has much more. Say where the number comes from.
 - **Floor first:** `t_floor = min(the chain as served, the members optimized alone)`. A fused kernel only
   counts for what it gains below `t_floor`, not below the stock chain; the single-kernel gain is that floor's.
-- **Fusion gain upper bound:** (graph nodes removed) × ~2 µs + intermediate bytes ÷ 7 TB/s per occurrence,
-  × occurrences, × the phase weight. Inside a captured graph a removed launch is ~2 µs, not the launch
-  latency a profiler shows. The expected value discounts it by the per-edge analysis below.
+- **Fusion-only gain upper bound,** per occurrence, three terms, each with its basis:
+  ```
+  absorbed light kernels      measured time of the light members the fused kernel absorbs (node cost + own time)
++ intermediates off HBM        intermediate bytes no longer written and read ÷ streaming bandwidth
++ overlap_hideable             min(T_wait_on_critical_path, T_independent_compute) × η
+  ```
+  × occurrences, × the phase weight. Inside a captured graph a removed launch is ~2 µs, not the launch latency
+  a profiler shows. `T_wait_on_critical_path` is the communication or wait the step actually waits for: a
+  collective's time on the slowest rank, spin and wait included, never the minimum over ranks or a time with the
+  spin removed. `T_independent_compute` is compute of the same step with no data dependency on it (the next
+  chunk, an independent part of the layer, another stream). `η` is the overlap efficiency measured for this kind
+  of overlap in this run or a record of the same deployment; without one give a range and mark the candidate
+  `measure`. The communication lower bound uses the summed bandwidth of every path the collective can use
+  concurrently; a point-to-point replacement of a collective is checked against it first. The expected value
+  discounts the upper bound by the per-edge analysis below.
+- **Shared vs fusion-only:** the independent tuning headroom of the region's heavy member is reachable by both
+  routes; it is `shared_gain` and is removed from both sides before the route is decided. Report it beside the
+  fusion-only number.
 - **Per edge** of the region: classify the dependency D0 local, D1 recomputable, D2 small-group reduction,
   D3 global reduction, D4 broadcast/reuse (prompt step 2), and check the three conditions of `01` §2. A D3 or
   D4 edge counts only if a rewrite removes it (another algorithm, fewer splits, last-arriver, algebraic split,
@@ -195,11 +265,16 @@ weights, and keep the fusion only when it is expected to win. The method is the 
 - **Coverage:** weight both gains by the share of GPU time the region covers in each phase and the batch /
   width distribution of the served recipe (`07` §3): a kernel speedup on a bucket the recipe rarely runs is
   worth that share, not the speedup.
-- **Route:** `fusion` when the fusion gain is larger, `single_kernel` otherwise. A region whose time is
-  mostly one member and whose neighbours are a small share of it is usually `single_kernel`.
+- **Route, per M bucket:** `fusion` when the fusion-only gain on top of the best split chain is at least
+  max(5%, the measurement noise) of the region time at that M; `single_kernel` when it is below and the
+  evidence is complete; `measure` when the answer depends on how fast an implementation can get (a fusable GEMM
+  against the library kernel, an overlap efficiency without a measurement). A region whose time is mostly one
+  member and whose neighbours are a small share of it is usually `single_kernel`. When `shared_gain` dwarfs
+  `fusion_only_gain`, the region is routed `single_kernel` first and the fusion is recorded as a later stacking
+  step (`composes_with`), not as a competitor.
 
-Record both numbers, the route and one line of basis (`gain_basis`: the nodes, bytes, edge classes and
-coverage the numbers come from) for every candidate.
+Record both numbers (shared and fusion-only), the route per M and one line of basis (`gain_basis`: the
+nodes, bytes, overlap terms, edge classes and coverage the numbers come from) for every candidate.
 
 **Every single-kernel hotspot too.** For each kernel in the TopK hotspots (the Top-N the run profiled,
 whether or not it is in a region), estimate its single-kernel gain the same way (weighted time × (1 −
@@ -208,9 +283,15 @@ numbers and the regions' `est_gain_pct_expected`, so both must be in the same un
 
 ### Step 6 — Ranking and recommendation
 
-Rank candidates by expected gain on the target metric; list at least the top 20. Resolve exclusivity
-and stacking, then state the total expected gain of the recommended set without double counting.
-Recommend only candidates whose route is `fusion`.
+Rank candidates by expected gain on the target metric (the serving-layer value, Estimation); list at least
+the top 20, each with its lower bound, expected value and upper bound. Resolve exclusivity and stacking, then
+state the total expected gain of the recommended set without double counting. Recommend only candidates whose
+route is `fusion` or `measure` at a served bucket that carries real weight.
+
+- Keep at least one candidate with a high upper bound and an uncertain expected value in the recommended set:
+  a systematic bias of the estimate is corrected only by measuring what it ranks low.
+- A candidate whose expected gain is below the run's A/B noise floor is `batch_only`: it is not worth an A/B of
+  its own and is meant to be measured stacked with others.
 
 Deliver:
 
@@ -222,7 +303,15 @@ Deliver:
 ## Estimation
 
 Gain and cost are estimated at the shapes actually served, by the co-optimization method
-(`../co-optimization/SKILL.md` §0.1 items 1–4; `01` §1–§3; `07` §1–§3).
+(`../co-optimization/SKILL.md` §0.1 items 1–4; `01` §1–§3; `07` §1–§3), in two layers:
+
+1. **Kernel layer:** per M, `t_chain`, `t_floor` and an interval for `t_fused`; the shared and fusion-only gains
+   (Step 5, with the overlap term). The bullets below are this layer.
+2. **Serving layer:** convert the step-level saving to the target metric with the Metric response table:
+   `e2e ≈ Σ_k s_k × step_delta_k`, as a lower bound, expected value and upper bound. A tail metric usually weighs
+   the longest step kinds above their device share; a mean metric does the opposite; throughput responds only
+   when the server is saturated. With an unknown `s_k`, only the kernel-layer verdict is reported and the
+   candidate is `measure`. Completed A/Bs of the run calibrate `s_k` (report the deviation).
 
 - **Fusion removes waiting, never work.** Gain comes from the HBM round trips of intermediates, the waits
   and joins between kernels, and the overlap or prefetch a single kernel makes expressible. Inside a captured
@@ -237,17 +326,18 @@ Gain and cost are estimated at the shapes actually served, by the co-optimizatio
 - **Cost** comes from lost parallelism (split-K, split-KV), replacing tuned heavy kernels (GEMMs, library
   operators: a rewrite in another DSL loses 5–10%), sync and recompute, and cross-module integration.
 - **Coverage:** convert to a share of total device time with the workload-summary weights, per bucket of the
-  served batch / width distribution. Report an upper bound and an expected value, and the reason for the
-  discount between them (`gain_basis`).
+  served batch / width distribution; the serving layer then converts that saving to the target metric. Report
+  a lower bound, an expected value and an upper bound, and the reason for the spread (`gain_basis`).
 
 As a summary of the trade-off:
 
 ```
-net gain = waits/joins removed + HBM traffic saved + overlap/prefetch gain + locality gain
-         − resource cost − occupancy loss − tile compromise − load imbalance − lost parallelism
+net gain (fusion-only) = waits/joins removed + HBM traffic saved + overlap/prefetch gain + locality gain
+                       − resource cost − occupancy loss − tile compromise − load imbalance − lost parallelism
+                       (gains of the heavy member alone are shared and excluded)
 ```
 
-Prefer the pattern with the largest expected net gain.
+Prefer the pattern with the largest expected net gain on the target metric, after the serving-layer conversion.
 
 ## References
 
