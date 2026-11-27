@@ -216,3 +216,14 @@ def test_the_kernel_fusion_record_is_added_to_the_result_and_nothing_else_change
     with_kf = rx.normalize_result({}, dict(wf, kernel_fusion=record))
     assert with_kf["kernel_fusion"] == record
     assert {k: v for k, v in with_kf.items() if k != "kernel_fusion"} == plain
+
+
+def test_the_mega_mode_switch_and_its_args_are_forwarded(monkeypatch):
+    a = kfa.workflow_args({"kernel_fusion": True})
+    assert "kf_mega_mode" not in a and "kf_mega_args" not in a                              # default: the skill link
+    a = kfa.workflow_args({"kernel_fusion": {"mega_mode": True, "mega_args": {"mega_candidate_timeout_s": 7200}}})
+    assert a["kf_mega_mode"] == "true" and a["kf_mega_args"] == {"mega_candidate_timeout_s": 7200}
+    monkeypatch.setenv("GEAK_KF_MEGA_MODE", "1")
+    monkeypatch.setenv("GEAK_KF_MEGA_ARGS", '{"mega_time_budget_s": 86400}')
+    a = kfa.workflow_args({"kernel_fusion": True})
+    assert a["kf_mega_mode"] == "true" and a["kf_mega_args"] == {"mega_time_budget_s": 86400}
