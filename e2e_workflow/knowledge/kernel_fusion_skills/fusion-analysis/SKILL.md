@@ -285,8 +285,8 @@ numbers and the regions' `est_gain_pct_expected`, so both must be in the same un
 
 Rank candidates by expected gain on the target metric (the serving-layer value, Estimation); list at least
 the top 20, each with its lower bound, expected value and upper bound. Resolve exclusivity and stacking, then
-state the total expected gain of the recommended set without double counting. Recommend only candidates whose
-route is `fusion` or `measure` at a served bucket that carries real weight.
+state the total expected gain of the recommended set without double counting.
+Recommend only candidates whose route is `fusion` (or `measure`) at a served bucket that carries real weight.
 
 - Keep at least one candidate with a high upper bound and an uncertain expected value in the recommended set:
   a systematic bias of the estimate is corrected only by measuring what it ranks low.
