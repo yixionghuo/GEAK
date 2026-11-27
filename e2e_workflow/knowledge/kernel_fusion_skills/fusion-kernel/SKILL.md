@@ -104,6 +104,10 @@ before the KV cache is sized, registrations).
 
 When the lane task says `L3 MEGAKERNEL on N ranks` (the region has `mega: true` and `required_gpu_count: N`):
 
+With `kf_mega_mode` on, this lane is `kernel_lane.js` mode=mega instead (the task says `optimized by mode=mega`): its own
+roles read the region UT (`region_ut` = this task dir) and follow `kernel_workflow/knowledge/mega/mega_region_ut.md`;
+the steps below are for the default lane.
+
 1. **Read the Mega skill first**: the file the task names (`kf_mega_skill`; by default
    `../co-optimization/MEGA_SKILL_LINK.md`, a placeholder until the user supplies the Mega skill's address or file:
    follow the link it gives, if any).

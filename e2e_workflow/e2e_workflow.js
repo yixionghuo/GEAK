@@ -3596,6 +3596,12 @@ const KF_COOPT_DIR = `${WORKFLOW_DIR}/knowledge/kernel_fusion_skills/co-optimiza
 const KF_KERNEL_SKILL = `${WORKFLOW_DIR}/knowledge/kernel_fusion_skills/fusion-kernel/SKILL.md`;
 // How to write an L3 MegaKernel: a link the operator replaces with the Mega skill's address or file.
 const KF_MEGA_SKILL = String(A.kf_mega_skill || `${KF_COOPT_DIR}/MEGA_SKILL_LINK.md`);
+// args.kf_mega_mode=true: an L3 MegaKernel region's lane is kernel_lane.js mode=mega on its region UT (region_ut);
+// mode=mega reads the UT itself. args.kf_mega_args (an object) adds mode=mega args, e.g. mega_candidate_timeout_s.
+const KF_MEGA_MODE = String(A.kf_mega_mode || 'false') === 'true';
+const KF_MEGA_ARGS = A.kf_mega_args && typeof A.kf_mega_args === 'object' ? A.kf_mega_args : {};
+const kfMegaLaneArgs = (c, taskDir) => (KF_MEGA_MODE && taskDir && kfMegaN(kfRegionOf(c))
+  ? { ...KF_MEGA_ARGS, mode: 'mega', region_ut: taskDir } : {});
 
 const KF_CANDIDATE_SCHEMA = obj({
   id: { type: 'string' },
@@ -3871,8 +3877,10 @@ function kfLaneTask(c) {
     launches_before: r.launches_before || (r.kernels || []).length, launches_after: r.launches_after || 1,
     suggested_design: r.fused_design || '', bitwise_exact_expected: !!r.bitwise_exact,
     ...kfPick(r, ['est_gain_pct_expected', 'single_kernel_gain_pct_expected', 'gain_basis', 'mega', 'required_gpu_count', 'comm']) };
-  const mega = !kfMegaN(r) ? '' : ` L3 MEGAKERNEL on ${kfMegaN(r)} ranks: follow the fusion-kernel skill's Mega chapter, ` +
-    `starting from the Mega skill ${KF_MEGA_SKILL}; the region UT runs every rank (scripts/mp_harness.py).`;
+  const mega = !kfMegaN(r) ? '' : KF_MEGA_MODE
+    ? ` L3 MEGAKERNEL on ${kfMegaN(r)} ranks, optimized by mode=mega on the region UT (KERNEL_PATH, region_ut).`
+    : ` L3 MEGAKERNEL on ${kfMegaN(r)} ranks: follow the fusion-kernel skill's Mega chapter, ` +
+      `starting from the Mega skill ${KF_MEGA_SKILL}; the region UT runs every rank (scripts/mp_harness.py).`;
   return `FUSION REGION ${r.id} (${r.level || '?'}): write ONE fused ${lang} kernel that replaces this whole ` +
     `kernel region of a live LLM serving stack. Read first, in this order: ${KF_COOPT_DIR}/fusion_kernel_prompt.md ` +
     `(the method, steps 0-7), ${KF_COOPT_DIR}/SKILL.md (§0.1, §0.2), then ${KF_KERNEL_SKILL} (the task dir and ` +
@@ -3974,6 +3982,7 @@ async function kfSlotCand(h, k) {
       kernel_path: x.task_dir, workflow_dir: KERNEL_WF_DIR,
       use_expert_skills: USE_EXPERT_SKILLS ? 'true' : 'false', expert_skills_dir: EXPERT_SKILLS_DIR, ...KB_ARGS,
       budget: KERNEL_BUDGET, gpu_ids: c.gpu_id, exp_root: `${EVAL_DIR}/kernels/_exp`, ...kfLaneGpus(c),
+      ...kfMegaLaneArgs(c, x.task_dir),
       task: kfLaneTask(c), apply_to_original: 'false',
     }, tag);
   } catch (e) {
@@ -6432,6 +6441,7 @@ while (want('kernel') && !TIME_DEADLINE_HIT && dispatched < BUDGET && (dispatche
         use_expert_skills: USE_EXPERT_SKILLS ? 'true' : 'false', expert_skills_dir: EXPERT_SKILLS_DIR,
         ...KB_ARGS,
         budget: KERNEL_BUDGET, gpu_ids: c.gpu_id, exp_root: `${EVAL_DIR}/kernels/_exp`, ...(KF_ON && kfLaneGpus(c)),
+        ...(KF_ON && kfMegaLaneArgs(c, ext.task_dir)),
         task: (KF_ON && kfLaneTask(c)) || 'Compare candidate backends ' + JSON.stringify(c.candidate_backends || []) +
           ' for this kernel; pick the fastest that passes the immutable unittest. ' + GRAPH_REQ + (TASK || ''),
         apply_to_original: 'false',

@@ -326,6 +326,11 @@ ok(lm.gpus_per_job === 2 && lm.gpu_ids === '0,1' && /L3 MEGAKERNEL on 2 ranks/.t
   lm.task.includes('co-optimization/MEGA_SKILL_LINK.md') && !('gpus_per_job' in laneOf(mg, 'kf_c2')) &&
   !/MEGAKERNEL/.test(laneOf(mg, 'kf_c2').task),
   'Mega: its lane runs on the group (gpu_ids, gpus_per_job) and reads the kf_mega_skill link first');
+const mm = run('on_agentx_mega_megamode'), lmm = laneOf(mm, 'kf_c5');
+ok(lmm.mode === 'mega' && lmm.region_ut && lmm.region_ut === lmm.kernel_path && lmm.mega_candidate_timeout_s === 7200 &&
+  lmm.gpus_per_job === 2 && lmm.gpu_ids === '0,1' && /optimized by mode=mega on the region UT/.test(lmm.task) &&
+  !lmm.task.includes('MEGA_SKILL_LINK') && !('mode' in laneOf(mm, 'kf_c2')) && !('mode' in lm),
+  'kf_mega_mode: a Mega lane is kernel_lane mode=mega on its region UT with kf_mega_args; other lanes and the default are unchanged');
 ok(promptOf(mg, 'handback kf_c5').includes('"required_gpu_count":2') && names(mg).includes('kf_c5'),
   'Mega: the hand-back states the ranks, and the region is A/B\'d and banked like any other');
 ok(kfOf(mg).unprepared.some((u) => u.id === 'c6' && u.reason === 'mega_needs_4_gpus') &&

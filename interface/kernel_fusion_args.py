@@ -40,6 +40,9 @@ _KNOBS = {
     "single_speedup_prior": ("GEAK_KF_SINGLE_SPEEDUP_PRIOR", "kf_single_speedup_prior"),
     # how to write an L3 MegaKernel: an address or a file (default: co-optimization/MEGA_SKILL_LINK.md)
     "mega_skill": ("GEAK_KF_MEGA_SKILL", "kf_mega_skill"),
+    # an L3 MegaKernel region's lane runs kernel_lane.js mode=mega on its region UT; kf_mega_args adds its args
+    "mega_mode": ("GEAK_KF_MEGA_MODE", "kf_mega_mode"),
+    "mega_args": ("GEAK_KF_MEGA_ARGS", "kf_mega_args"),
 }
 _PATH_ARGS = ("kf_prompt", "kf_trace_dir", "kf_workload_summary", "kf_topk_json")
 
@@ -131,6 +134,11 @@ def build_args(cfg: dict) -> dict:
         if arg and cfg.get(key) not in (None, ""):
             a[arg] = cfg[key]
     a["kf_prompt"] = ",".join(prompt_files(cfg))
+    if isinstance(a.get("kf_mega_args"), str):
+        # a JSON object of mode=mega args (env or CLI give it as text)
+        a["kf_mega_args"] = json.loads(a["kf_mega_args"]) if a["kf_mega_args"].strip() else {}
+    if "kf_mega_mode" in a:
+        a["kf_mega_mode"] = "true" if _truthy(a["kf_mega_mode"]) else "false"
     ms = str(a.get("kf_mega_skill") or "")
     if ms and "://" not in ms:
         # a file is resolved like the other paths; an address (URL) is passed as it is

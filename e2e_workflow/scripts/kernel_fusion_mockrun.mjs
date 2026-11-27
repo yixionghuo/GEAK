@@ -215,6 +215,7 @@ const args = {
     candidates: CANDS.map((c) => (c.id === 'c2' ? { ...c, seam: C2_SEAM } : c)) } } : {}),
   ...(scenario.includes('budget1') ? { head_budget: 1 } : {}),
   ...(scenario.includes('levels') ? { kf_implementable_levels: 'L1,L2' } : {}),
+  ...(scenario.includes('megamode') ? { kf_mega_mode: 'true', kf_mega_args: { mega_candidate_timeout_s: 7200 } } : {}),
   ...(scenario === 'on_setup' ? { phases: 'setup' } : {}),
   ...(scenario === 'on_resume' ? { phases: 'kernel,final',
     state: JSON.parse(await readFile(process.env.KF_MOCK_STATE, 'utf8')) } : {}),
