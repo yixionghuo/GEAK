@@ -20,6 +20,18 @@ switch), it is not a phase of its own: it is broken down into the stages GEAK al
   A/B with the region's UT). The order and estimates are `kernel_fusion.schedule`. The Milestone queue is
   ordered by the same estimate. Without a fusion profile (switched off, failed, empty) HeadKernel and the
   Milestone order are exactly GEAK's own.
+  **Selection inside a slot** (`head_multi_min_pct`, default 5): every option of the slot (the head's own
+  single-kernel route and each region on its kernels) estimated at or above the threshold runs; when none reaches
+  it, only the best-estimated option runs and the rest are recorded as `not_run` in the schedule (a region left
+  out stays queued for the Milestone loop). **Stacking** (`kf_stack_on_head`, default on): a region on the head's
+  own kernel is built ON TOP of the head's banked single-kernel winner (its lane is told the winner and must keep
+  it inside the fused kernel) and is A/B'd after the head, against the overlay that already holds the winner, so a
+  pass is the fusion-only gain; it competes in the head's A/B only when the head's route is not run, produced
+  nothing, or the analysis marks the region `exclusive_with` the head. **Deferred targets** (AgentX): a
+  single-kernel target KernelExtract deferred for budget whose analysis estimate reaches the threshold gets its UT
+  right after the fusion profile (one scoped kernel-extract call) and joins the head queue; one that needs several
+  GPUs stays deferred (`kernel_fusion.deferred_heads`). **Speedup review**: the analysis' upper bound
+  (`est_gain_pct_upper`, serving layer) joins the device-time estimate the review threshold is computed from.
 - **L3 MegaKernel** regions (`mega: true`, `required_gpu_count` N, `comm`) are recommended by the analysis like
   any L3 region (only L4 is unsupported by default); the code drops a recommended region whose level is not in
   `kf_implementable_levels`. A MegaKernel's UT is prepared on a leased group of N cards (`GPU_GROUP`, via the

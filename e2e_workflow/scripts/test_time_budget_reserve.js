@@ -373,8 +373,8 @@ console.log("\n# a trace replay keeps a same-window win for Validate, whatever t
     'and a run that kept nothing still skips it');
   const sites = src.match(/integAccepted\([^;{]*&& beatsCurTput\(integ2?, curTput\)/g) || [];
   const outside = src.replace(/function beatsCurTput\([\s\S]*?\n\}\n/, '');
-  ok(sites.length === 6 && !/e2e_throughput_tok_s > curTput/.test(outside),
-    `all six banking sites apply it after integAccepted, and none compares with curTput itself (${sites.length} found)`);
+  ok(sites.length === 7 && !/e2e_throughput_tok_s > curTput/.test(outside),
+    `all seven banking sites (incl. a region built on its head's winner) apply it after integAccepted, and none compares with curTput itself (${sites.length} found)`);
 }
 
 console.log('\n# the reserve boundary is armed and gates the Finalize-gate');

@@ -89,9 +89,13 @@ CAND_KEYS = ("id", "rank", "level", "region", "kernels", "phases", "occurrences"
              # the route against optimizing the region's kernels one by one: "single_kernel" is never prepared or routed
              "single_kernel_gain_pct_expected", "route", "gain_basis",
              # an L3 MegaKernel region runs its UT and lane on a whole group of required_gpu_count GPUs
-             "mega", "required_gpu_count", "comm")
+             "mega", "required_gpu_count", "comm",
+             # the analysis' interval, shared vs fusion-only split, per-M verdicts and stacking
+             "est_gain_pct_lower", "est_gain_pct_upper", "shared_gain_pct", "fusion_only_gain_pct", "per_m_route",
+             "composes_with", "step_deltas")
 # every TopK single-kernel hotspot's expected gain alone: HeadKernel orders heads and regions by it
-HOTSPOT_KEYS = ("kernel", "pct_gpu_time", "single_kernel_gain_pct_expected", "basis")
+HOTSPOT_KEYS = ("kernel", "pct_gpu_time", "single_kernel_gain_pct_expected", "single_kernel_gain_pct_lower",
+                "single_kernel_gain_pct_upper", "basis")
 
 
 def slim_topk(d: dict) -> dict:

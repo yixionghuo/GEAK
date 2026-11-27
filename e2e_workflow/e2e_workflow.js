@@ -535,9 +535,13 @@ function speedupEstimate(pct_gpu_time, isolated, integ) {
   return { pct_gpu_time: pct, estimate_pct: saved >= 1 ? Infinity : (1 / (1 - saved) - 1) * 100,
     source: uniform ? 'coverage_uniform_estimate' : 'coverage_per_path' };
 }
-function speedupNeedsReview(pct_gpu_time, isolated, integ) {
+// upperPct: the analysis' own upper bound for this candidate in target-metric % (fusion-analysis serving layer),
+// when it has one. A serving-layer estimate already includes effects device time misses (tail metrics, queueing),
+// so the larger of it and the device-time estimate is what a measurement is held against.
+function speedupNeedsReview(pct_gpu_time, isolated, integ, upperPct) {
   if (!parityIsSoft(integ)) return false;
-  const ceilPct = speedupEstimate(pct_gpu_time, isolated, integ).estimate_pct;
+  const dev = speedupEstimate(pct_gpu_time, isolated, integ).estimate_pct;
+  const ceilPct = Number.isFinite(upperPct) && upperPct > 0 ? Math.max(dev, upperPct) : dev;
   if (!Number.isFinite(ceilPct)) return false;
   return ((integ && integ.e2e_delta_pct) || 0) > ceilPct * (1 + IMPLAUSIBLE_SPEEDUP_MARGIN) + 1e-9;
 }
@@ -578,16 +582,16 @@ function rejectClass(reason) {
 }
 // runIntegrateBothLegs resolves the review before any caller can bank the candidate. A confirmed
 // measurement can exceed the estimate by any amount; actual parity failures still reject.
-function integAccepted(integ, pct_gpu_time, isolated) {
+function integAccepted(integ, pct_gpu_time, isolated, upperPct) {
   return !!(integ && (integ.gate === 'accepted' || integ.gate === 'stack')
     && integ.ab_complete !== false && integ.output_parity !== 'fail'
     && !(integ.speedup_review && ['pending', 'inconclusive', 'rejected'].includes(integ.speedup_review.status))
-    && (!speedupNeedsReview(pct_gpu_time, isolated, integ) || confirmedSpeedup(integ)));
+    && (!speedupNeedsReview(pct_gpu_time, isolated, integ, upperPct) || confirmedSpeedup(integ)));
 }
-function gateRejectReason(integ, pct_gpu_time, isolated) {
+function gateRejectReason(integ, pct_gpu_time, isolated, upperPct) {
   if (integ && integ.output_parity === 'fail') return 'parity_regression';
   if (integ && (integ.gate === 'accepted' || integ.gate === 'stack')
-      && !integAccepted(integ, pct_gpu_time, isolated))
+      && !integAccepted(integ, pct_gpu_time, isolated, upperPct))
     return 'speedup_review_pending: independent A/B confirmation required';
   return integ ? (integ.reason || integ.gate || '') : '';
 }
@@ -2837,8 +2841,9 @@ async function reviewSpeedup(integ, inputs, label, phaseName) {
   }
   const kr = inputs.KERNEL_RESULT || {};
   const pct = kr.pct_gpu_time || 0, isolated = kr.verified_isolated_speedup || 0;
+  const upper = Number(kr.est_gain_pct_upper);
   if (!abDone(integ) || !['accepted', 'stack'].includes(integ.gate) || integ.output_parity === 'fail'
-      || !speedupNeedsReview(pct, isolated, integ) || confirmedSpeedup(integ)) return integ;
+      || !speedupNeedsReview(pct, isolated, integ, upper) || confirmedSpeedup(integ)) return integ;
   if (integ.speedup_review && ['inconclusive', 'rejected'].includes(integ.speedup_review.status)) return integ;
   const original = integ.measurement_evidence || {};
   const estimate = speedupEstimate(pct, isolated, integ);
@@ -3640,10 +3645,14 @@ const KF_OVERLAY_CHECK_SCHEMA = obj({ ok: { type: 'boolean' }, problems: arrStr,
 const KF_CAND_KEYS = ['id', 'rank', 'level', 'region', 'kernels', 'phases', 'occurrences', 'm_range', 'seam',
   'inputs_outputs', 'launches_before', 'launches_after', 'region_pct_device_time', 'est_gain_pct_expected',
   'difficulty', 'bitwise_exact', 'exclusive_with', 'language', 'fallback', 'fused_design',
-  'single_kernel_gain_pct_expected', 'route', 'gain_basis', 'mega', 'required_gpu_count', 'comm'];
+  'single_kernel_gain_pct_expected', 'route', 'gain_basis', 'mega', 'required_gpu_count', 'comm',
+  // the analysis' interval, shared vs fusion-only split, per-M verdicts and stacking (fusion-analysis Step 4-6)
+  'est_gain_pct_lower', 'est_gain_pct_upper', 'shared_gain_pct', 'fusion_only_gain_pct', 'per_m_route',
+  'composes_with', 'step_deltas'];
 const KF_ROUTE_KEYS = ['id', 'rank', 'level', 'region', 'kernels', 'phases', 'm_range', 'seam',
   'region_pct_device_time', 'est_gain_pct_expected', 'single_kernel_gain_pct_expected', 'route', 'difficulty',
-  'bitwise_exact', 'exclusive_with', 'fallback', 'mega', 'required_gpu_count', 'comm'];
+  'bitwise_exact', 'exclusive_with', 'fallback', 'mega', 'required_gpu_count', 'comm',
+  'est_gain_pct_lower', 'est_gain_pct_upper', 'fusion_only_gain_pct', 'composes_with'];
 const kfPick = (c, keys) => Object.fromEntries(keys.filter((k) => c[k] !== undefined).map((k) => [k, c[k]]));
 const kfList = (v) => (Array.isArray(v) ? v.map(String) : []);
 const kfSeamOf = (c) => (c && c.seam && c.seam.target_callable) || '';
@@ -3745,7 +3754,8 @@ async function kfProfile(phaseName) {
       candidates, recommended: recommended.filter((id) => !singleRoute.has(id)),
       single_kernel_route: [...singleRoute],
       hotspots: (Array.isArray(res.hotspots) ? res.hotspots : []).filter((h) => h && h.kernel).map((h) => kfPick(h,
-        ['kernel', 'pct_gpu_time', 'single_kernel_gain_pct_expected', 'basis'])) }));
+        ['kernel', 'pct_gpu_time', 'single_kernel_gain_pct_expected', 'single_kernel_gain_pct_lower',
+          'single_kernel_gain_pct_upper', 'basis'])) }));
     log(`[kf] fusion profile: ${candidates.length} candidates, recommended ${JSON.stringify(kfRecord.recommended)}` +
       (singleRoute.size ? `; single-kernel route ${JSON.stringify([...singleRoute])}` : ''));
   } catch (e) {
@@ -3843,6 +3853,85 @@ async function kfPrepareRegions(prepared, throughput) {
   log(`[kf] region UTs: ${fused.length} of ${picks.length} recommended region(s) joined the prepared inventory.`);
   return prepared;
 }
+// AgentX: a single-kernel target KernelExtract deferred (for budget) whose analysis estimate reaches
+// HEAD_MULTI_MIN_PCT gets its UT now, scoped to that one task, so HeadKernel can rank it with the others. A target
+// that needs several GPUs stays deferred: head lanes lease one GPU (only L3 MegaKernel regions run on a group).
+const kfHotspotOf = (ids) => (kfRecord.hotspots || []).find((x) => x.single_kernel_gain_pct_expected != null &&
+  ids.some((d) => kernelIdentitiesMatch(x.kernel, d)));
+async function kfPrepareDeferredHeads(prepared, throughput) {
+  if (!KF_ON || !KERNEL_EXTRACT_ON || !(kfRecord.hotspots || []).length || searchClosed('deferred head UTs')) return prepared;
+  kfClock();
+  const late = () => kfLeftMs() <= AGENT_TIMEOUT_FLOOR_MS;
+  const picks = [];
+  for (const d of prepared.deferred_tasks || []) {
+    const ids = [...kfList(d.identities), d.device_kernel, d.short_name].filter(Boolean).map(String);
+    const hs = kfHotspotOf(ids);
+    const est = hs ? Number(hs.single_kernel_gain_pct_expected) || 0 : 0;
+    if (!hs || est < HEAD_MULTI_MIN_PCT) continue;
+    if ((parseInt(d.required_gpu_count, 10) || 1) > 1 || String(d.op_kind || '') === 'collective') {
+      kfRecord.deferred_heads = (kfRecord.deferred_heads || []).concat([{ short_name: d.short_name, est_gain_pct: est,
+        reason: 'needs a multi-GPU head lane (head lanes lease one GPU)' }]);
+      continue;
+    }
+    picks.push({ d, est, hs });
+  }
+  if (!picks.length) return prepared;
+  log(`[kf] deferred targets estimated at or above ${HEAD_MULTI_MIN_PCT}%: ` +
+    picks.map((p) => `${p.d.short_name} ${p.est.toFixed(2)}%`).join(', ') + ' — preparing their UTs.');
+  const got = await parallel(picks.map((p, i) => async () => {
+    if (late()) return { p, why: 'time: the fusion share of the search window is spent' };
+    const t = String(p.d.short_name || `deferred_${i}`);
+    const inputs = {
+      EVAL_DIR, MODEL_PATH, GPU_ID: GPU_LIST[i % GPU_LIST.length], WORKLOAD, TASK, ROUND: `deferred_${t}`,
+      BASELINE_LOG: `${EVAL_DIR}/baseline/server.log`, BASELINE_BENCH_DIR: `${EVAL_DIR}/baseline`,
+      BASELINE_SUMMARY: `${EVAL_DIR}/baseline_summary.md`, BASELINE_ITERATION_DIR: `${EVAL_DIR}/baseline/iterations`,
+      EVIDENCE_DIR: `${EVAL_DIR}/kernel_extraction/round_deferred_${t}`,
+      BASELINE_THROUGHPUT: BASELINE_TPUT, CURRENT_THROUGHPUT: throughput,
+      CURRENT_FLAGS: curFlags, CURRENT_ENV: curEnv, CURRENT_OVERLAY: curOverlay,
+      PREVIOUS_WORKLOAD_JSON: (profile && profile.profile_workload_json) || '',
+      PREVIOUS_RANKING_JSON: (profile && profile.kernel_ranking_json) || '',
+      PREVIOUS_UT_DELIVERY: (profile && profile.kernel_extraction_delivery_json) || '',
+      DEFERRED_TASK: p.d, SOURCE_DELIVERY_REQUIRED: true,
+      REMAINING_MIN: Math.min(remainingMin(), Math.round(kfLeftMs() / 60000)),
+      SKILL_DIR: WORKFLOW_DIR, ...TRACELENS_INPUTS, ...ANALYSIS_SKILL_INPUTS, ...KB_REF_INPUTS,
+    };
+    const intro = kfIntro(`Explicit user scope (overrides the default selection): complete exactly ONE task, the ` +
+      `deferred task in DEFERRED_TASK (${t}), which the baseline preparation deferred for budget. The fusion analysis ` +
+      `estimates its single-kernel gain at ${p.est.toFixed(2)}% of the target metric (${p.hs.basis || p.hs.kernel}). ` +
+      'Reuse the saved evidence (PREVIOUS_* and the deferred record), build and GPU-validate its UT on GPU_ID only, ' +
+      'and keep a concrete blocker in the delivery if it cannot be built. When only part of its live boundary can run ' +
+      'on one GPU (e.g. a phase whose entry launches a collective), build the UT for the single-GPU phases that carry ' +
+      'the weight and record the excluded phase. Pack with `agentx_kernel_preparation.mjs --emit-prepared` and return ' +
+      'ONLY {delivery_path, prepared} (prepared = that stdout VERBATIM). Do not optimize or integrate.');
+    const reply = await safeAgent(roleAgent('kernel_extractor', 'prepare', intro, inputs),
+      { phase: 'KernelExtract', label: `kernel_extractor:prepare deferred ${t}`, schema: AGENTX_PREPARATION_SCHEMA },
+      1, kfTimeout(Infinity));
+    try {
+      if (!reply?.delivery_path) throw new Error('no delivery_path');
+      const prep = readAgentXPreparation(reply);
+      const all = [...prep.head_candidates, ...prep.kernel_candidates];
+      const k = all.find((x) => x && x.short_name === t) || (all.length === 1 ? all[0] : null);
+      if (!k) return { p, why: 'no passing task in the delivery' };
+      const ut = reusePreparedUT(k);
+      return ut.smoke === 'pass' ? { p, k } : { p, why: ut.smoke_detail || 'prepared UT did not pass' };
+    } catch (e) {
+      return { p, why: String((e && e.message) || e).slice(0, 300) };
+    }
+  }));
+  const added = [];
+  for (const r of got.filter(Boolean)) {
+    if (r.k) {
+      added.push(r.k.short_name);
+      prepared.head_candidates = [...(prepared.head_candidates || []), r.k];
+      prepared.deferred_tasks = (prepared.deferred_tasks || []).filter((d) => d !== r.p.d);
+    } else {
+      kfRecord.deferred_heads = (kfRecord.deferred_heads || []).concat([{ short_name: r.p.d.short_name,
+        est_gain_pct: r.p.est, reason: String(r.why).slice(0, 600) }]);
+    }
+  }
+  log(`[kf] deferred-target UTs: ${added.length} of ${picks.length} joined the head queue${added.length ? ` (${added.join(', ')})` : ''}.`);
+  return prepared;
+}
 // An L3 MegaKernel region's UT runs on a whole group: its preparation leases required_gpu_count cards (makeSem,
 // so two groups never overlap), every other region keeps its one card. Its lanes get the group as gpu_ids with
 // gpus_per_job = required_gpu_count: kernel_lane.js leases the N cards per command (gpu_lock pool:N:<ids>).
@@ -3919,17 +4008,22 @@ function kfBanked(rec) {
 // analysis' hotspots, else the Amdahl ceiling of its GPU-time share at KF_SINGLE_SPEEDUP_PRIOR.
 const KF_SINGLE_SPEEDUP_PRIOR = parseFloat(A.kf_single_speedup_prior) || 1.2;
 const kfOwnKernels = (h) => [requiredDeviceKernel(h), h.device_kernel, ...kfList(h.selected_device_kernels)].filter(Boolean);
+const kfNum = (v) => (Number.isFinite(Number(v)) && v !== null && v !== '' ? Number(v) : null);
 function kfGain(c) {
   const r = kfRegionOf(c);
-  if (r) return { pct: Number(r.est_gain_pct_expected) || 0, basis: r.gain_basis || 'est_gain_pct_expected' };
+  if (r) return { pct: Number(r.est_gain_pct_expected) || 0, upper: kfNum(r.est_gain_pct_upper),
+    basis: r.gain_basis || 'est_gain_pct_expected' };
   const own = kfOwnKernels(c);
   const hs = (kfRecord.hotspots || []).find((x) => x.single_kernel_gain_pct_expected != null &&
     own.some((d) => kernelIdentitiesMatch(x.kernel, d)));
-  if (hs) return { pct: Number(hs.single_kernel_gain_pct_expected) || 0, basis: `hotspot: ${hs.basis || hs.kernel}` };
+  if (hs) return { pct: Number(hs.single_kernel_gain_pct_expected) || 0, upper: kfNum(hs.single_kernel_gain_pct_upper),
+    basis: `hotspot: ${hs.basis || hs.kernel}` };
   const a = amdahlCeilingPct(c.pct_gpu_time, KF_SINGLE_SPEEDUP_PRIOR);
   return { pct: Number.isFinite(a) ? a : 0, basis: `amdahl(pct_gpu_time ${c.pct_gpu_time || 0}, ${KF_SINGLE_SPEEDUP_PRIOR}x)` };
 }
 const estGainPct = (c) => kfGain(c).pct;
+// The analysis' upper bound for a candidate (target-metric %), or null: the speedup review reads it as the estimate.
+const kfUpperPct = (c) => (KF_ON && kfRegions.size && c ? kfGain(c).upper : null);
 // The Milestone queue best estimate first; as it is without a fusion profile (KernelFusion then changes nothing).
 const kfByGain = (q) => (!kfRegions.size ? q : (q || []).slice().sort((a, b) => estGainPct(b) - estGainPct(a)));
 // HeadKernel: one slot per head, joined by every queued fusion region whose kernels include the head's own
@@ -3938,6 +4032,30 @@ const kfByGain = (q) => (!kfRegions.size ? q : (q || []).slice().sort((a, b) => 
 // Milestone loop. Inside a slot the candidates run best estimate first, a region as its region UT and one fused
 // kernel from kernel_lane.js, and all of them meet in the slot's one A/B, against one shared reference.
 const kfIsFusion = (k) => { const r = kfRegionOf(k); return !!r && r.route !== 'single_kernel'; };
+// Inside a slot, every option (the head's own single-kernel route and each region on its kernels) estimated at
+// or above HEAD_MULTI_MIN_PCT runs; when none reaches it, only the best-estimated option runs. An option left out
+// stays queued (a region goes on to the Milestone loop). Estimates are target-metric % (fusion-analysis Step 6).
+const HEAD_MULTI_MIN_PCT = (() => { const v = parseFloat(A.head_multi_min_pct); return Number.isFinite(v) && v >= 0 ? v : 5; })();
+function kfSlotSelect(sl) {
+  const opts = [...(sl.h.kf_only ? [] : [{ kind: 'head', est: sl.headGain }]),
+    ...sl.kf.map((k) => ({ kind: 'region', k, est: estGainPct(k) }))];
+  if (!opts.length) return;
+  const keep = opts.filter((o) => o.est >= HEAD_MULTI_MIN_PCT);
+  const chosen = keep.length ? keep : [opts.slice().sort((a, b) => b.est - a.est)[0]];
+  sl.skipHead = !sl.h.kf_only && !chosen.some((o) => o.kind === 'head');
+  sl.dropped = sl.kf.filter((k) => !chosen.some((o) => o.k === k));
+  sl.kf = sl.kf.filter((k) => chosen.some((o) => o.k === k));
+}
+// A region on a head's own kernel is built ON TOP of the head's single-kernel winner (fusion-analysis rule 3):
+// it runs after the head's A/B, against the overlay that banked the winner, unless the analysis marks it
+// exclusive with the head (exclusive_with names the head) or the head's route is not run.
+const kfExclusiveWithHead = (k, h) => {
+  const r = kfRegionOf(k) || {};
+  const names = [h.short_name, ...kfOwnKernels(h)].filter(Boolean).map(String);
+  return kfList(r.exclusive_with).some((x) => names.some((n) => n === x || kernelIdentitiesMatch(x, n)));
+};
+const KF_STACK_ON_HEAD = String(A.kf_stack_on_head != null ? A.kf_stack_on_head : 'true') !== 'false';
+const kfStacksOnHead = (sl, k) => KF_STACK_ON_HEAD && !sl.h.kf_only && !sl.skipHead && !kfExclusiveWithHead(k, sl.h);
 const kfSlotRegions = (h, regions) => regions.filter((k) =>
   kfList(kfRegionOf(k).kernels).some((n) => kfOwnKernels(h).some((d) => kernelIdentitiesMatch(n, d))));
 function kfSlots() {
@@ -3954,16 +4072,24 @@ function kfSlots() {
   for (const sl of slots) {
     sl.headGain = sl.h.kf_only ? -Infinity : estGainPct(sl.h);
     sl.kf = kfByGain(sl.kf);
-    sl.gain = Math.max(sl.headGain, ...sl.kf.map(estGainPct));
+    kfSlotSelect(sl);
+    sl.stack = sl.kf.filter((k) => kfStacksOnHead(sl, k));
+    sl.kf = sl.kf.filter((k) => !sl.stack.includes(k));
+    sl.gain = Math.max(sl.skipHead ? -Infinity : sl.headGain, ...[...sl.kf, ...sl.stack].map(estGainPct));
   }
   const pick = slots.sort((a, b) => b.gain - a.gain).slice(0, HEAD_BUDGET);
   pick.forEach((sl, i) => Object.assign(sl.h, { idx: i, gpu_id: GPU_LIST[i % GPU_LIST.length] }));
   const row = (c, kind) => ({ short_name: c.short_name || kfShortOf(kfRegionOf(c)), kind,
     est_gain_pct: +estGainPct(c).toFixed(3), basis: kfGain(c).basis });
-  kfRecord.schedule = pick.map((sl) => ({ slot: sl.h.short_name, candidates: [...(sl.h.kf_only ? [] : [row(sl.h, 'head')]),
-    ...sl.kf.map((k) => row(k, 'fusion'))].sort((a, b) => b.est_gain_pct - a.est_gain_pct) }));
-  log(`[kf] HeadKernel schedule (best estimate first, ${pick.length} of ${slots.length} slot(s)): ` + kfRecord.schedule
-    .map((sl) => `${sl.slot} [${sl.candidates.map((c) => `${c.short_name} ${c.est_gain_pct}%`).join(', ')}]`).join('; '));
+  kfRecord.schedule = pick.map((sl) => ({ slot: sl.h.short_name,
+    candidates: [...(sl.h.kf_only || sl.skipHead ? [] : [row(sl.h, 'head')]), ...sl.kf.map((k) => row(k, 'fusion')),
+      ...sl.stack.map((k) => row(k, 'fusion_on_head'))].sort((a, b) => b.est_gain_pct - a.est_gain_pct),
+    ...((sl.skipHead || sl.dropped.length) ? { not_run: [...(sl.skipHead ? [row(sl.h, 'head')] : []),
+      ...sl.dropped.map((k) => row(k, 'fusion'))] } : {}) }));
+  log(`[kf] HeadKernel schedule (best estimate first, ${pick.length} of ${slots.length} slot(s); options at or above ` +
+    `${HEAD_MULTI_MIN_PCT}% all run, else only the best): ` + kfRecord.schedule
+    .map((sl) => `${sl.slot} [${sl.candidates.map((c) => `${c.short_name} ${c.est_gain_pct}%${c.kind === 'fusion_on_head' ? ' (on head)' : ''}`).join(', ')}]` +
+      (sl.not_run ? ` not run: ${sl.not_run.map((c) => `${c.short_name} ${c.est_gain_pct}%`).join(', ')}` : '')).join('; '));
   return pick;
 }
 // The slot's regions estimated above its head (first) or not (after it): each a fused candidate, or none.
@@ -3972,7 +4098,7 @@ async function kfSlotCands(sl, first) {
   for (const k of sl.kf) if ((estGainPct(k) > sl.headGain) === first) out.push(...(await kfSlotCand(sl.h, k)));
   return out;
 }
-async function kfSlotCand(h, k) {
+async function kfSlotCand(h, k, onWinner) {
   const at = kernelQueue.indexOf(k);
   if (at < 0 || laneWindowShort(`fused lane ${h.short_name}`)) return [];
   const c = { ...kfExpand(kernelQueue.splice(at, 1)[0]), gpu_id: h.gpu_id };
@@ -3995,7 +4121,7 @@ async function kfSlotCand(h, k) {
       kernel_path: x.task_dir, workflow_dir: KERNEL_WF_DIR,
       use_expert_skills: USE_EXPERT_SKILLS ? 'true' : 'false', expert_skills_dir: EXPERT_SKILLS_DIR, ...KB_ARGS,
       budget: KERNEL_BUDGET, gpu_ids: c.gpu_id, exp_root: `${EVAL_DIR}/kernels/_exp`, ...kfLaneGpus(c),
-      task: kfLaneTask(c), apply_to_original: 'false',
+      task: kfLaneTask(c) + kfOnWinnerTask(h, onWinner), apply_to_original: 'false',
     }, tag);
   } catch (e) {
     return fail(`fused kernel lane failed (${String(e).slice(0, 300)})`);
@@ -4010,6 +4136,19 @@ async function kfSlotCand(h, k) {
   // kind 'authored' keeps the head's corrective re-author; winner_kind 'patch' banks it as the Milestone loop does.
   return [{ kind: 'authored', source: c.short_name, winner_kind: 'patch', language: c.candidate_backends[0],
     final_patch: r.final_patch, kernel_eval_dir: r.eval_dir, isolated: iso, kf: c, kfx: x }];
+}
+// A region built on top of its head's banked single-kernel winner: the lane carries the winner's implementation of
+// the shared member inside the fused kernel and adds only the fusion-only gain; its A/B reference is the overlay
+// that banked the winner.
+function kfOnWinnerTask(h, w) {
+  if (!w) return '';
+  const what = [w.source && `${w.winner_kind || 'winner'} ${w.source}`, w.final_patch && `patch ${w.final_patch}`,
+    w.apply_env && `env ${w.apply_env}`, w.apply_flags && `flags ${w.apply_flags}`,
+    w.accepted_overlay && `accepted overlay ${w.accepted_overlay}`].filter(Boolean).join(', ');
+  return ` STACK ON THE HEAD WINNER: ${h.short_name}'s single-kernel optimization is already banked (${what}). This region contains ` +
+    'that kernel: port the winner\'s implementation of it into kernel_src/ first and keep it (the fused kernel must ' +
+    'call or contain the winner, never fall back to the stock member), then add only the fusion-only levers on top. ' +
+    'The e2e reference is the current accepted overlay, which already includes the winner.';
 }
 // The head's A/B, corrective and pending entry of a fused candidate: the region's UT, seam and share. {} otherwise.
 function kfHeadResult(cand) {
@@ -4947,6 +5086,7 @@ print(json.dumps(res))
       if (KF_ON) {
         await kfProfile('KernelExtract');
         strategy = await kfPrepareRegions(strategy, kbSeedTput || BASELINE_TPUT);
+        strategy = await kfPrepareDeferredHeads(strategy, kbSeedTput || BASELINE_TPUT);
       }
     } else {
       phase('Profile');
@@ -6056,6 +6196,11 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
     let headExt = null, routeEnded = false;
     headRoute: {
     if (h.kf_only) { routeEnded = true; break headRoute; }
+    if (slot.skipHead) {
+      log(`  ${h.short_name}: single-kernel route not run (estimate ${(+estGainPct(h)).toFixed(2)}% below ` +
+        `${HEAD_MULTI_MIN_PCT}% and below this slot's best option).`);
+      routeEnded = true; break headRoute;
+    }
     // (h1) Extract the op into a standalone immutable unittest (fused heads stay fused: gemmSynthFor).
     const ext = await extractWithBaseline(
       'kernel_extractor', 'extract_op', 'Build a standalone op unittest for a head kernel.', {
@@ -6224,6 +6369,13 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
     }
     } // end headRoute
     if (KF_ON && slot.kf) headCands.push(...(await kfSlotCands(slot, false)));
+    if (KF_ON) {
+      if (slot.stack && slot.stack.length && !headCands.length) {
+        log(`  ${h.short_name}: no single-kernel winner to stack on; ${slot.stack.length} region(s) on its kernel run on their own.`);
+        for (const k of slot.stack) headCands.push(...(await kfSlotCand(h, k)));
+        slot.stack = [];
+      }
+    }
     const ext = (KF_ON && !headExt) ? kfSlotExt(headCands) : headExt;
     if (!headCands.length) {
       if (routeEnded) continue;    // the route already said why
@@ -6255,7 +6407,8 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
         apply_env: cand.apply_env || '', apply_flags: cand.apply_flags || '',
         code_patch: cand.code_patch || cand.final_patch || '', tuning_artifact: cand.tuning_artifact || '',
         verified_isolated_speedup: cand.isolated || 0, pct_gpu_time: h.pct_gpu_time,
-        parity_note: cand.parity_note || 'expected_close', ...(KF_ON && kfHeadResult(cand)) },
+        parity_note: cand.parity_note || 'expected_close', ...(KF_ON && kfHeadResult(cand)),
+        ...(KF_ON && kfUpperPct(cand.kf || h) != null ? { est_gain_pct_upper: kfUpperPct(cand.kf || h) } : {}) },
       CURRENT_OVERLAY: curOverlay, CURRENT_FLAGS: curFlags, CURRENT_ENV: curEnv,
       CURRENT_THROUGHPUT: curTput, SKILL_DIR: WORKFLOW_DIR, ...(KF_ON && kfAccuracyFor(cand.kf)),
       CAND_TAG: `c${ci}_${cand.source}`,
@@ -6275,7 +6428,8 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
       const abc = !!(integ && integ.gate !== 'incomplete' && integ.ab_complete !== false);
       if (sharedRefMed == null && abc && integ.ref_med) sharedRefMed = integ.ref_med;   // lock the shared ref
       if (ci === 0) top = { cand, inputs, integ, abc };
-      const passed = abc && integAccepted(integ, (KF_ON && kfHeadPct(cand)) || h.pct_gpu_time, cand.isolated) && beatsCurTput(integ, curTput);
+      const upperPct = KF_ON ? kfUpperPct(cand.kf || h) : null;
+      const passed = abc && integAccepted(integ, (KF_ON && kfHeadPct(cand)) || h.pct_gpu_time, cand.isolated, upperPct) && beatsCurTput(integ, curTput);
       // One ledger row per candidate (short_name:backend), so the report sees every backend's e2e.
       history.ledger.push({ direction: `${h.short_name}:${cand.source}`, isolated_speedup: cand.isolated || 0,
         e2e_delta_pct: integ ? (integ.e2e_delta_pct || 0) : 0,
@@ -6285,7 +6439,7 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
         if (!bestPick || integ.e2e_throughput_tok_s > bestPick.integ.e2e_throughput_tok_s) bestPick = { cand, integ, inputs };
         log(`  ${h.short_name}: candidate ${cand.source} PASSED e2e gate (${integ.e2e_throughput_tok_s} tok/s, +${integ.e2e_delta_pct}%).`);
       } else {
-        log(`  ${h.short_name}: candidate ${cand.source} ${abc ? `rejected (${gateRejectReason(integ, (KF_ON && kfHeadPct(cand)) || h.pct_gpu_time, cand.isolated)})` : `A/B incomplete (${integ ? integ.reason || integ.gate : 'null/timeout'})`}.`);
+        log(`  ${h.short_name}: candidate ${cand.source} ${abc ? `rejected (${gateRejectReason(integ, (KF_ON && kfHeadPct(cand)) || h.pct_gpu_time, cand.isolated, upperPct)})` : `A/B incomplete (${integ ? integ.reason || integ.gate : 'null/timeout'})`}.`);
       }
     }
 
@@ -6351,6 +6505,47 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
         } else {
           log(`  ${h.short_name}: REJECTED at e2e gate (${reason}).`);
           history.ledger.push({ direction: h.short_name, isolated_speedup: cand.isolated, e2e_delta_pct: integ.e2e_delta_pct || 0, verdict: 'dead_end', lesson: reason || 'no e2e gain' });
+        }
+      }
+    }
+    // Regions on this head's kernel, built ON TOP of the banked single-kernel winner (fusion-analysis rule 3):
+    // each is A/B'd against the overlay that already holds the winner, so a pass is the fusion-only gain.
+    if (KF_ON) {
+      if (slot.stack && slot.stack.length) {
+        const w = bestPick ? { source: bestPick.cand.source || '', winner_kind: bestPick.cand.winner_kind || '',
+          final_patch: bestPick.cand.final_patch || '', apply_env: bestPick.cand.apply_env || '',
+          apply_flags: bestPick.cand.apply_flags || '', accepted_overlay: bestPick.integ.accepted_overlay || '' } : null;
+        for (const k of slot.stack) {
+          if (TIME_DEADLINE_HIT || searchClosed(`${h.short_name}: region on the head winner`)) break;
+          for (const cand of await kfSlotCand(h, k, w)) {
+            const inputs = mkIntegrateInputs(cand, headCands.length, null);
+            const integ = await runIntegrateBothLegs(
+              'Apply a fused region built on top of this head\'s banked single-kernel winner; gate on e2e throughput ' +
+              'against the current accepted overlay, which already includes the winner (no shared reference to reuse).',
+              inputs, `integrate ${h.short_name}:${cand.source} (on head)`, 'HeadKernel');
+            const abc = !!(integ && integ.gate !== 'incomplete' && integ.ab_complete !== false);
+            const pct = kfHeadPct(cand) || h.pct_gpu_time;
+            const passed = abc && integAccepted(integ, pct, cand.isolated, kfUpperPct(cand.kf)) && beatsCurTput(integ, curTput);
+            history.ledger.push({ direction: `${h.short_name}:${cand.source}:on_head`, isolated_speedup: cand.isolated || 0,
+              e2e_delta_pct: integ ? (integ.e2e_delta_pct || 0) : 0,
+              verdict: passed ? 'confirmed' : (abc ? 'candidate_rejected' : 'incomplete'),
+              lesson: integ ? (integ.reason || integ.gate || '') : 'null/timeout' });
+            if (passed) {
+              curOverlay = integ.accepted_overlay || curOverlay;
+              curTput = integ.e2e_throughput_tok_s;
+              bankAccepted(acceptedHeads, { short_name: `${h.short_name}+${cand.source}`, op_kind: 'fusion', backend: cand.source,
+                kind: cand.winner_kind, ...e2eFrom(integ), isolated: cand.isolated, stacked_on: bestPick ? h.short_name : '' }, krOf(inputs));
+              log(`  ${h.short_name}: region ${cand.source} ACCEPTED on top of the head winner. e2e now ${curTput} tok/s (+${integ.e2e_delta_pct}%).`);
+            } else if (!abc) {
+              pendingIntegrations.push({ track: 'head', short_name: `${h.short_name}+${cand.source}`, isolated: cand.isolated || 0,
+                pct_gpu_time: pct, inputs, winner_kind: cand.winner_kind, apply_env: '', apply_flags: '',
+                op_kind: 'fusion', backend: cand.source,
+                partial: integ ? { gate: integ.gate, ref_med: integ.ref_med, cand_med: integ.cand_med, reason: integ.reason } : null });
+              log(`  ${h.short_name}: region ${cand.source} on the head winner: A/B incomplete; kept as PENDING.`);
+            } else {
+              log(`  ${h.short_name}: region ${cand.source} on the head winner rejected (${gateRejectReason(integ, pct, cand.isolated, kfUpperPct(cand.kf))}).`);
+            }
+          }
         }
       }
     }

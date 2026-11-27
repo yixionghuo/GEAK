@@ -38,11 +38,21 @@ const CANDS = [
 // gives none (h_gemm falls back to the Amdahl ceiling of its 20% at 1.2x, 3.45).
 const HOTSPOTS = scenario.includes('noest') ? [] : [
   { kernel: 'gemm_kernel', pct_gpu_time: 12, single_kernel_gain_pct_expected: 1.2, basis: 'untuned', x: 1 },
-  { kernel: 'gemm_bf16_kernel', pct_gpu_time: 20, single_kernel_gain_pct_expected: scenario.includes('nowin') ? 5 : 2.5,
-    basis: 'tuned lib' }];
+  { kernel: 'gemm_bf16_kernel', pct_gpu_time: 20,
+    single_kernel_gain_pct_expected: scenario.includes('rulehi') ? 6 : scenario.includes('nowin') ? 5 : 2.5,
+    basis: 'tuned lib' },
+  // *_deferred: two targets KernelExtract deferred, both estimated above 5%: h_idx (one GPU) gets its UT after the
+  // fusion profile; coll_x (a collective, two GPUs) stays deferred.
+  ...(scenario.includes('deferred') ? [
+    { kernel: 'idx_logits_kernel', pct_gpu_time: 11, single_kernel_gain_pct_expected: 6, basis: 'untuned gluon' },
+    { kernel: 'nccl_kernel', pct_gpu_time: 19, single_kernel_gain_pct_expected: 7, basis: 'link floor' }] : [])];
 // The head scenarios add c4, an L2 region on the head h_gemm's own kernel (GEMM + bias + GELU).
 const C4 = { id: 'c4', rank: 5, level: 'L2', region: 'gemm + bias + gelu', kernels: ['gemm_bf16_kernel', 'gelu_kernel'],
-  seam: { target_callable: 'pkg.mlp:MLP.forward' }, region_pct_device_time: 22, est_gain_pct_expected: 3 };
+  seam: { target_callable: 'pkg.mlp:MLP.forward' }, region_pct_device_time: 22,
+  est_gain_pct_expected: scenario.includes('rulehi') ? 5.5 : 3 };
+// *_rule*: HeadKernel's own selection rule (options at or above head_multi_min_pct, default 5%, all run; else only
+// the best) and regions built on top of the head's winner. Every other scenario pins the earlier behaviour: all
+// options run and a region on the head's kernel competes in the head's A/B.
 // on_agentx_route: the analysis judges c1 worth more as single-kernel work (route single_kernel) but still
 // lists it in "recommended": the workflow must drop it.
 const ROUTE = scenario.includes('route');
@@ -70,9 +80,21 @@ const H_EXT = { short_name: 'h_gemm', op_kind: 'gemm', editable: true, task_dir:
     live_candidate_targets: [H_SEAM.target_callable], deepest_verified: true } };
 const AX_HEAD = { ...H_GEMM, op_kind: 'gemm', prepared_ut: { phase: 'extract_op', result: H_EXT } };
 // AgentX: the kernel-extract skill's {delivery_path, prepared} envelope, one validated UT per [name, pct, op_kind].
-const prepared = (round, rows, heads = []) => ({ delivery_path: `${EV}/kernel_extraction/round_${round}/delivery.json`,
+const prepared = (round, rows, heads = [], deferred = []) => ({ delivery_path: `${EV}/kernel_extraction/round_${round}/delivery.json`,
   prepared: { head_candidates: heads, kernel_candidates: rows.map(([n, pct, kind]) => ({ short_name: n, pct_gpu_time: pct,
-    op_kind: kind, prepared_ut: { phase: 'extract', result: { ...ext(n), op_kind: kind } } })) } });
+    op_kind: kind, prepared_ut: { phase: 'extract', result: { ...ext(n), op_kind: kind } } })),
+    ...(deferred.length ? { deferred_tasks: deferred } : {}) } });
+const DEFERRED = scenario.includes('deferred') ? [
+  { short_name: 'h_idx', identities: ['idx_logits_kernel'], state: 'deferred_budget', reason: 'not started within budget' },
+  { short_name: 'coll_x', identities: ['nccl_kernel'], op_kind: 'collective', required_gpu_count: 2,
+    state: 'deferred_budget', reason: 'multi-rank UT not authored' }] : [];
+const IDX_EXT = { ...H_EXT, short_name: 'h_idx', op_kind: 'attn', task_dir: `${EV}/tasks/h_idx`, device_kernel: 'idx_logits_kernel',
+  target_callable: 'pkg.idx:topk', selection_validation: { ...H_EXT.selection_validation, target_callable: 'pkg.idx:topk',
+    device_kernel: 'idx_logits_kernel', candidate_targets_tested: ['pkg.idx:topk'], live_candidate_targets: ['pkg.idx:topk'] },
+  seam_candidates: [{ target_callable: 'pkg.idx:topk', role: 'inner_launcher', depth: 1, device_kernels: ['idx_logits_kernel'] }] };
+const AX_IDX = { short_name: 'h_idx', pct_gpu_time: 11, entity_kind: 'gpu_kernel', device_kernel: 'idx_logits_kernel',
+  op_kind: 'attn', candidate_backends: ['triton'], seam_candidates: IDX_EXT.seam_candidates,
+  prepared_ut: { phase: 'extract_op', result: IDX_EXT } };
 const integ = (name, gate, d, extra = {}) => ({ short_name: name, gate, ab_complete: gate !== 'incomplete',
   e2e_throughput_tok_s: 100 + d, e2e_delta_pct: d, ref_med: 100, cand_med: 100 + d, output_parity: 'pass',
   parity_kind: 'byte_exact', accepted_overlay: ['accepted', 'stack'].includes(gate) ? `${EV}/overlay/cand_${name}` : '',
@@ -117,6 +139,9 @@ const answers = {
     on_head_pending: headInteg('kf_c4', 'incomplete', 0, { reason: 'server never healthy' }),
     on_head_fix: headInteg('kf_c4', 'rejected', 0, { reason: 'cuda_graph_capture_unsafe: host sync on the hot path' }),
   }[scenario] || headInteg('kf_c4', 'accepted', 6, { parity_kind: 'accuracy' })),
+  // *_rulehi: the region built on top of the head's banked winner (aiter, 103 tok/s) adds +4% against it.
+  'integrate h_gemm:kf_c4 (on head)': () => headInteg('kf_c4', 'accepted', 4,
+    { parity_kind: 'accuracy', ref_med: 103, cand_med: 107.12, e2e_throughput_tok_s: 107.12 }),
   'integrate h_gemm:kf_c4 (finish 1)': () => headInteg('kf_c4', 'incomplete', 0),
   'integrate h_gemm:kf_c4 (finish 2)': () => headInteg('kf_c4', 'incomplete', 0),
   'integrate h_gemm:kf_c4 (finish 3)': () => headInteg('kf_c4', 'incomplete', 0),
@@ -162,7 +187,10 @@ const answers = {
     recommended: [...(AGX ? ['c1', 'c2', 'c3'] : ['c1', 'c2']), ...(HEAD ? ['c4'] : []), ...(MEGA ? ['c5', 'c6'] : [])],
     hotspots: HOTSPOTS }),
   // --- AgentX: one prepared single kernel; the recommended regions get their own region UT ---
-  'kernel_extractor:prepare baseline': () => prepared('baseline', [['k_norm', 5, 'norm']], HEAD ? [AX_HEAD] : []),
+  'kernel_extractor:prepare baseline': () => prepared('baseline', [['k_norm', 5, 'norm']], HEAD ? [AX_HEAD] : [], DEFERRED),
+  'kernel_extractor:prepare deferred h_idx': () => prepared('deferred_h_idx', [], [AX_IDX]),
+  'bakeoff h_idx': () => ({ gate: 'no_win', isolated_speedup: 1.0, measured: true, reason: 'mock: no faster backend',
+    author_plan: [] }),
   'kernel_extractor:prepare kf_c1': () => prepared('kf_c1', [['kf_c1', 4, 'fusion']]),
   'kernel_extractor:prepare kf_c2': () => prepared('kf_c2', [['kf_c2', 6, 'fusion']]),
   'kernel_extractor:prepare kf_c4': () => prepared('kf_c4', [['kf_c4', 22, 'fusion']]),
@@ -214,6 +242,7 @@ const args = {
   ...(scenario === 'on_topk' ? { kf_topk_json: '/data/topk.json', kf_topk: { recommended: ['c1', 'c2'], hotspots: HOTSPOTS,
     candidates: CANDS.map((c) => (c.id === 'c2' ? { ...c, seam: C2_SEAM } : c)) } } : {}),
   ...(scenario.includes('budget1') ? { head_budget: 1 } : {}),
+  ...(scenario.includes('rule') ? {} : { head_multi_min_pct: 0, kf_stack_on_head: 'false' }),
   ...(scenario.includes('levels') ? { kf_implementable_levels: 'L1,L2' } : {}),
   ...(scenario === 'on_setup' ? { phases: 'setup' } : {}),
   ...(scenario === 'on_resume' ? { phases: 'kernel,final',

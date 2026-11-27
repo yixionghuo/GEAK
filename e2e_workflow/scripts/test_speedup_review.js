@@ -340,3 +340,21 @@ test('a checkpoint is named by a real measurement digest, never by placeholder t
   await g.runIntegrateBothLegs('test', inputs, 'h1', 'HeadKernel');
   assert.match(g.checkpoints[0].path, new RegExp(`candidate_blockscale_${hex}/`));
 });
+
+test("the analysis' serving-layer upper bound raises the review threshold; without it the device-time estimate stands", async () => {
+  // +7.72% on a 7.18% / 1.46x head: the device-time estimate (2.31%) asks for a review; an analysis upper bound of 9%
+  // (tail metrics, queueing already included) does not, and a bound below the device estimate never lowers it.
+  const c = candidate();
+  const h = harness(c);
+  assert.equal(h.speedupNeedsReview(7.18, 1.4596, c), true);
+  assert.equal(h.speedupNeedsReview(7.18, 1.4596, c, 9), false);
+  assert.equal(h.speedupNeedsReview(7.18, 1.4596, c, 1), true);
+  assert.equal(h.integAccepted(c, 7.18, 1.4596, 9), true);
+  assert.equal(h.integAccepted(c, 7.18, 1.4596), false);
+  // reviewSpeedup reads it from KERNEL_RESULT.est_gain_pct_upper: no confirmation A/B is started.
+  const g = harness(c);
+  const res = await g.reviewSpeedup(c, { ...inputs, KERNEL_RESULT: { ...inputs.KERNEL_RESULT, est_gain_pct_upper: 9 } },
+    'h1', 'HeadKernel');
+  assert.equal(g.calls.length, 0);
+  assert.equal(res.gate, 'accepted');
+});

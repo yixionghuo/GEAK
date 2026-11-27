@@ -86,9 +86,9 @@ const count = (s) => src.split(s).length - 1;
 ok(count('if (KF_ON && slot.kf) headCands.push(...(await kfSlotCands(slot, true)));') === 1 &&
   count('if (KF_ON && slot.kf) headCands.push(...(await kfSlotCands(slot, false)));') === 1 &&
   count('const slots = (KF_ON && !FAST_MODE && kfRegions.size) ? kfSlots() : heads.map((h) => ({ h }));') === 1 &&
-  count('const ext = (KF_ON && !headExt) ? kfSlotExt(headCands) : headExt;') === 1 && count('break headRoute;') === 4 &&
+  count('const ext = (KF_ON && !headExt) ? kfSlotExt(headCands) : headExt;') === 1 && count('break headRoute;') === 5 &&
   count('kernel_candidates: KF_ON ? kfByGain(kernelQueue) : kernelQueue') === 2 &&
-  count('...(KF_ON && kfHeadResult(cand)) },') === 1 && count('...(KF_ON && kfAccuracyFor(cand.kf)),') === 1 &&
+  count('...(KF_ON && kfHeadResult(cand)),') === 1 && count('...(KF_ON && kfAccuracyFor(cand.kf)),') === 1 &&
   count('(KF_ON && kfHeadPct(cand)) || h.pct_gpu_time') === 4 && count('...(KF_ON && kfHeadSpec(cand)),') === 2,
   'HeadKernel takes a region as one more candidate: its A/B inputs, gate share, pending entry and correctives');
 // Outside its own blocks every KernelFusion reference sits behind KF_ON, so a GEAK test that slices one
@@ -121,8 +121,8 @@ ok(/integ = await reviewSpeedup\(integ, withTuning, label, phaseName\);\s*if \(K
 ok(/if \(KF_ON && k\.op_kind === 'fusion'\) kfBanked\(list\[list\.length - 1\]\);/.test(src) &&
   !/\bkind: 'fusion'/.test(src), 'a banked region stays kind "patch" (the KB replay reads it) with an op_kind tag');
 ok(/fusion_analyst:analyze', schema: KF_OPPORTUNITY_SCHEMA \}, 2, kfTimeout\(3600000\)\)/.test(src) &&
-  (src.match(/1, kfTimeout\(Infinity\)\)/g) || []).length === 2,
-  'what runs ahead of the search is bounded: the analysis 2 x <= 1 h, each region UT call one attempt');
+  (src.match(/1, kfTimeout\(Infinity\)\)/g) || []).length === 3,
+  'what runs ahead of the search is bounded: the analysis 2 x <= 1 h, each region / deferred-target UT call one attempt');
 const block = src.slice(src.indexOf('const KF_SKILL_DIR ='), src.indexOf("if (want('setup')) {"));
 ok(block.length > 10000 && !/Date\.now|require\(|process\./.test(block),
   'the KernelFusion helpers use no construct the workflow sandbox forbids');
@@ -368,7 +368,7 @@ ok(before(hd, 'extract kf_c4', 'extract_op h_gemm') && before(hd, 'bakeoff h_gem
 const sched = (r) => (kfOf(r).schedule || []).map((sl) => [sl.slot, sl.candidates.map((c) => `${c.short_name}:${c.kind}:${c.est_gain_pct}`)]);
 ok(same(sched(hd), [['h_gemm', ['kf_c4:fusion:3', 'h_gemm:head:2.5']], ['kf_c2', ['kf_c2:fusion:1.5']]]) &&
   kfOf(hd).schedule[0].candidates[1].basis === 'hotspot: tuned lib' &&
-  hd.logs.some((l) => l.startsWith('[kf] HeadKernel schedule (best estimate first, 2 of 2 slot(s)): h_gemm [kf_c4 3%, h_gemm 2.5%]; kf_c2')),
+  hd.logs.some((l) => l.startsWith('[kf] HeadKernel schedule (best estimate first, 2 of 2 slot(s); options at or above 0% all run, else only the best): h_gemm [kf_c4 3%, h_gemm 2.5%]; kf_c2')),
   'on_head: the schedule (slot, candidates, estimates and their basis) is recorded and logged');
 const ok2 = krIn(hd, 'integrate kf_c2:kf_c2');
 ok(before(hd, 'integrate h_gemm:triton', 'extract kf_c2') && before(hd, 'handback kf_c2', 'integrate kf_c2:kf_c2') &&
@@ -469,6 +469,41 @@ ok(!labels(axh).some((l) => /^extract/.test(l)) && labels(axh).includes('kernel_
   before(axh, 'integrate kf_c2:kf_c2', 'integrate k_norm') && !labels(axh).some((l) => /^integrate kf_c\d$/.test(l)) &&
   (heads(axh)[0] || {}).fusion_id === 'c4',
   'AgentX: every slot takes its region\'s prepared UT (nothing is extracted), best estimate first; the Milestone loop gets the single kernel');
+
+
+console.log('\n## H. HeadKernel selection rule and regions built on the head winner');
+// on_head_rule: h_gemm (2.5%) and its region kf_c4 (3%) are both below head_multi_min_pct (5%): only the best runs.
+const rl = run('on_head_rule');
+const rlSched = kfOf(rl).schedule || [];
+ok(rlSched[0] && rlSched[0].slot === 'h_gemm' && same(rlSched[0].candidates.map((c) => c.short_name), ['kf_c4']) &&
+  same((rlSched[0].not_run || []).map((c) => `${c.short_name}:${c.kind}`), ['h_gemm:head']) &&
+  rl.logs.some((l) => l.includes('h_gemm: single-kernel route not run (estimate 2.50% below 5%')) &&
+  !rl.lanes.some((x) => (x.kernel_path || '').endsWith('/h_gemm')) && labels(rl).includes('integrate h_gemm:kf_c4') &&
+  !labels(rl).includes('integrate h_gemm:aiter'),
+  'rule: below 5% only the best-estimated option of a slot runs (the head route is recorded as not run)');
+// on_head_rulehi: h_gemm 6% and kf_c4 5.5% are both at or above 5%: both run, kf_c4 on top of the banked winner.
+const rh = run('on_head_rulehi');
+const rhSched = (kfOf(rh).schedule || [])[0] || { candidates: [] };
+const c4Lane = rh.lanes.find((x) => (x.kernel_path || '').endsWith('/kf_c4')) || {};
+const onHead = rh.calls.filter((c) => c.label === 'integrate h_gemm:kf_c4 (on head)');
+ok(same(rhSched.candidates.map((c) => `${c.short_name}:${c.kind}`), ['h_gemm:head', 'kf_c4:fusion_on_head']) &&
+  labels(rh).indexOf('integrate h_gemm:aiter') < labels(rh).indexOf('integrate h_gemm:kf_c4 (on head)') &&
+  !labels(rh).includes('integrate h_gemm:kf_c4') && /STACK ON THE HEAD WINNER/.test(c4Lane.task || '') &&
+  /env aiter/.test(c4Lane.task || '') && onHead.length === 1 && !/REUSE_REF/.test(onHead[0].prompt),
+  'rule: at or above 5% every option runs; a region on the head\'s kernel is built and A/B\'d on top of the banked winner');
+ok(same((rh.result.accepted_heads || []).map((a) => `${a.short_name}:${a.stacked_on || ''}`),
+  ['h_gemm:', 'h_gemm+kf_c4:h_gemm', 'kf_c2:']) &&
+  rh.logs.some((l) => l.includes('region kf_c4 ACCEPTED on top of the head winner. e2e now 107.12')),
+  'rule: the stacked region is banked after the winner, against the overlay that holds it');
+// on_agentx_rule_deferred: a deferred one-GPU target estimated at 6% gets its UT and a slot; a collective stays deferred.
+const rd = run('on_agentx_rule_deferred');
+ok(labels(rd).includes('kernel_extractor:prepare deferred h_idx') && !labels(rd).some((l) => /prepare deferred coll_x/.test(l)) &&
+  ((kfOf(rd).schedule || [])[0] || {}).slot === 'h_idx' &&
+  same((kfOf(rd).deferred_heads || []).map((d) => d.short_name), ['coll_x']),
+  'rule: a deferred target estimated at or above 5% gets its UT after the fusion profile and joins HeadKernel; a multi-GPU one stays deferred');
+ok(/const HEAD_MULTI_MIN_PCT = /.test(src) && /kf_stack_on_head/.test(src) &&
+  /function speedupNeedsReview\(pct_gpu_time, isolated, integ, upperPct\)/.test(src),
+  'rule knobs: head_multi_min_pct (default 5), kf_stack_on_head (default on); the review reads the analysis upper bound');
 
 console.log(failures === 0 ? '\nPASS: KernelFusion runs inside GEAK\'s own stages; off, it leaves no trace.'
   : `\n${failures} check(s) FAILED`);
