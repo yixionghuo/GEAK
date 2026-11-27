@@ -33,10 +33,10 @@ const coverage = (rows = [7.18, 3.47, 1.37]) => ({
 });
 
 function harness(original = candidate(), fresh = candidate({ measurement_evidence: measurement('confirmation') }), closed = false,
-  short = () => false) {
+  short = () => false, clock = {}) {
   const calls = [], checkpoints = [], windows = [];
-  const safeAgent = async (request, opts, tries) => {
-    calls.push({ ...request, opts, tries });
+  const safeAgent = async (request, opts, tries, timeoutFor) => {
+    calls.push({ ...request, opts, tries, timeoutMs: timeoutFor ? timeoutFor() : null });
     return structuredClone(request.inputs.FORCE_FRESH_AB ? fresh : original);
   };
   const abWindowShort = (legs, what, passes = 1) => {
@@ -50,6 +50,13 @@ function harness(original = candidate(), fresh = candidate({ measurement_evidenc
     const AB_FINISH_RETRIES = 3, log = () => {}, tuningIntegrateInputs = () => ({}), KF_ON = false;
     const roleAgent = (role, phase, intro, inputs) => ({role, phase, intro, inputs});
     const adoptAbandonedVerdict = async r => r;
+    const IS_AGENTX = ${!!clock.agentx}, AGENT_TIMEOUT_MS = ${clock.agentTimeoutMs || 7200000};
+    const TIME_BUDGET_MS = ${clock.remainingMs == null ? 'null' : 1}, FINAL_PHASE_STARTED = false;
+    const FINAL_RESERVE_MS = ${clock.reserveMs || 0}, remainingMs = () => ${clock.remainingMs || 0};
+    const agentTimeoutFor = () => TIME_BUDGET_MS == null ? AGENT_TIMEOUT_MS
+      : Math.max(120000, Math.min(AGENT_TIMEOUT_MS, remainingMs() - FINAL_RESERVE_MS));
+    const agentxLegS = (w) => w + 1200, AGENTX_AB_OVERHEAD_S = 600;
+    const agentxAbMs = (legs, passes = 1) => 1000 * (legs * passes * agentxLegS(900) + AGENTX_AB_OVERHEAD_S);
     ${core}\n${abDone}\n${abLegs}\n${wrapper}
     return { speedupEstimate, speedupNeedsReview, confirmedSpeedup, integAccepted, gateRejectReason,
       rejectClass, reviewSpeedup, runIntegrateBothLegs };
@@ -298,4 +305,38 @@ test('ordinary and byte-exact wins retain their acceptance behavior', async () =
   assert.equal(h.rejectClass('speedup_review_inconclusive: configuration mismatch'), '');
   assert.equal(h.rejectClass('signature_mismatch'), 'integration');
   assert.equal(h.rejectClass('accuracy_regression'), 'correctness');
+});
+
+test('a trace-replay review gets the time its two-replica A/B needs, not the 2h per-agent cap', async () => {
+  // GLM-5.2 c40 run (2026-11-26): the review of a +7.33% Mega candidate needed ~2.5h (2 legs x 2 replicas of a
+  // 900s replay + warmups), was abandoned at the 2h cap, and its valid confirmation arrived after the slot chose.
+  const needMs = 1000 * (2 * 2 * (900 + 1200) + 600);
+  const big = candidate({ e2e_delta_pct: 30, cand_med: 435.7, e2e_throughput_tok_s: 435.7 });
+  const confirm = { ...big, measurement_evidence: measurement('confirmation') };
+  const h = harness(big, confirm, false, () => false, { agentx: true, remainingMs: 20 * 3600000, reserveMs: 3 * 3600000 });
+  await h.reviewSpeedup(big, inputs, 'h1', 'HeadKernel');
+  const review = h.calls.find((c) => c.inputs.FORCE_FRESH_AB);
+  assert.ok(review, 'the review ran');
+  assert.ok(review.timeoutMs >= needMs, `review timeout ${review.timeoutMs} < ${needMs}`);
+  assert.ok(review.timeoutMs > 7200000);
+  // Never past the search window before the final reserve.
+  const tight = harness(big, confirm, false, () => false, { agentx: true, remainingMs: 4 * 3600000, reserveMs: 2 * 3600000 });
+  await tight.reviewSpeedup(big, inputs, 'h1', 'HeadKernel');
+  assert.equal(tight.calls.find((c) => c.inputs.FORCE_FRESH_AB).timeoutMs, 2 * 3600000);
+  // A fixed-sequence run keeps the ordinary cap.
+  const plain = harness(big, confirm, false, () => false, { agentx: false });
+  await plain.reviewSpeedup(big, inputs, 'h1', 'HeadKernel');
+  assert.equal(plain.calls.find((c) => c.inputs.FORCE_FRESH_AB).timeoutMs, 7200000);
+});
+
+test('a checkpoint is named by a real measurement digest, never by placeholder text', async () => {
+  const placeholder = 'computed as sha256(ref_summary path+content, cand_summary path+content) - see integrate_result.json';
+  // byte-exact parity: no review, so the checkpoint is named by this A/B's own (placeholder) id
+  const h = harness(candidate({ parity_kind: 'byte_exact', measurement_evidence: measurement(placeholder) }));
+  await h.runIntegrateBothLegs('test', { ...inputs, CAND_TAG: 'c1_kf_region' }, 'h1', 'HeadKernel');
+  assert.match(h.checkpoints[0].path, /overlay\/candidate_blockscale_c1_kf_region\/e2e_validation\.json$/);
+  const hex = 'a'.repeat(64);
+  const g = harness(candidate({ parity_kind: 'byte_exact', measurement_evidence: measurement(hex) }));
+  await g.runIntegrateBothLegs('test', inputs, 'h1', 'HeadKernel');
+  assert.match(g.checkpoints[0].path, new RegExp(`candidate_blockscale_${hex}/`));
 });

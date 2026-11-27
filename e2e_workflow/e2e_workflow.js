@@ -2810,6 +2810,23 @@ async function adoptAbandonedVerdict(integ, label) {
 // re-invoke it in resume mode for the missing leg (up to AB_FINISH_RETRIES). Every integrate site
 // uses this, so an A/B never ends after the reference leg alone.
 const SPEEDUP_REVIEW_RESULTS = new Map();
+// The confirmation runs fresh servers for both legs with at least two timed replicas each: on a trace
+// replay that is ~4 replay windows plus their warmups (~2.5h at a 900s window), longer than the default
+// per-agent cap (AGENT_TIMEOUT_MS, 2h). A review abandoned at that cap still finishes and returns a valid
+// confirmation that nobody reads, so the candidate stays 'inconclusive' and loses its slot. Give the
+// review agent the A/B's own estimate plus headroom, never beyond the search window before the reserve.
+const REVIEW_TIMEOUT_HEADROOM = 1.25;
+function reviewAgentTimeoutFor(reviewInputs) {
+  const needMs = IS_AGENTX
+    ? Math.ceil(agentxAbMs(abLegs(reviewInputs), Math.max(1, Number(reviewInputs.REPLICAS) || 1)) * REVIEW_TIMEOUT_HEADROOM)
+    : 0;
+  return () => {
+    const base = agentTimeoutFor();
+    if (!(needMs > base)) return base;
+    if (TIME_BUDGET_MS == null || FINAL_PHASE_STARTED) return needMs;
+    return Math.max(base, Math.min(needMs, remainingMs() - FINAL_RESERVE_MS));
+  };
+}
 async function reviewSpeedup(integ, inputs, label, phaseName) {
   // The workflow never writes 'pending': it is the integrator's own flag, and it must neither block a
   // gain the estimate allows nor stand in for the confirmation the estimate requires.
@@ -2858,7 +2875,8 @@ async function reviewSpeedup(integ, inputs, label, phaseName) {
     'measure at least two replicas per leg and repeat the configured correctness and engagement gates. ' +
     'Do not reuse old benchmark legs or rewrite the kernel. Amdahl is an estimate, never a correctness verdict. ' +
     'Return the fresh measurements and their provenance; if the gain reproduces, accept even above the estimate.',
-    reviewInputs), { phase: phaseName, label: `${label} speedup review`, schema: INTEGRATE_SCHEMA }, 1);
+    reviewInputs), { phase: phaseName, label: `${label} speedup review`, schema: INTEGRATE_SCHEMA }, 1,
+    reviewAgentTimeoutFor(reviewInputs));
   let result = pending;
   if (fresh && fresh.ab_complete === true && fresh.gate !== 'incomplete') {
     const checked = { ...fresh, speedup_review: { status: 'confirmed', original_measurement: original, estimate } };
@@ -2911,7 +2929,10 @@ async function runIntegrateBothLegs(intro, inputs, label, phaseName) {
   if (KF_ON) integ = await kfOverlayGate(integ, withTuning, phaseName);
   if (integ && integ.short_name) {
     // Preserve every candidate's review when several backends share one head short_name.
-    const measurementId = (integ.measurement_evidence && integ.measurement_evidence.measurement_id) || withTuning.CAND_TAG || '';
+    const reportedId = (integ.measurement_evidence && integ.measurement_evidence.measurement_id) || '';
+    // Only an identifier names the directory: an integrator once returned the schema's description
+    // ("computed as sha256(...) see integrate_result.json") as the id, which became the directory name.
+    const measurementId = (/^[A-Za-z0-9_.-]{1,128}$/.test(reportedId) ? reportedId : '') || withTuning.CAND_TAG || '';
     const candidateId = [integ.short_name, measurementId].filter(Boolean).join('_').replace(/[^A-Za-z0-9_.-]+/g, '_');
     const kr = withTuning.KERNEL_RESULT || {};
     const accepted = integAccepted(integ, kr.pct_gpu_time, kr.verified_isolated_speedup);
