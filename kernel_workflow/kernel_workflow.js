@@ -1,7 +1,7 @@
 export const meta = {
   name: 'kernel-workflow',
-  description: 'Single ENTRY POINT for kernel optimization on AMD GPUs: Instinct MI-series (CDNA gfx942/gfx950) and the validated RDNA4 product Radeon AI PRO R9700 (gfx1201). The worker validates on-box identity via structured rocminfo data; generic gfx1201 is not a product identity. Dispatches on args.mode: optimize/author -> delegate one unchanged single-language lane to the kernel_lane worker (backward compatible); bakeoff -> freeze the input kernel into ONE immutable oracle + frozen baseline, discover per-language existing impls + offline-tune env backends (aiter/CK), then run one worker lane per backend language (HIP/Triton/FlyDSL/CK/...) in parallel over the GPU pool and pick the fastest verified result across ALL candidates (author/optimize lanes AND the tuned env backend) — every one scored against the SAME frozen original baseline (anti-cheating). Wraps the unchanged kernel_lane worker (one workflow() nesting level; the dispatcher is the bake-off orchestrator).',
-  whenToUse: 'Optimize a kernel. Three modes, all via args.mode (there is NO natural-language mode detection — the caller picks): mode=optimize (DEFAULT) speeds up an EXISTING kernel and behaves exactly like the old single-language workflow; mode=author writes a fresh implementation from scratch, then optimizes it — use it when there is no source to edit yet, or to port the op to another language (pass args.target_language); mode=bakeoff tries several backend languages in parallel and keeps the fastest (pass args.backends, or leave empty to auto-discover). Bakeoff Freeze establishes structured product/ISA identity before Discover; optional expected_gfx/expected_target pins are validated against it. Anything else throws. Pass args.kernel_path (required), args.workflow_dir (required), args.mode, args.target_language, args.backends, args.budget, args.gpu_ids, args.gpu_mode (pool|pin, default pool), args.gpus_per_job / args.job_gpu_ids (optional: a task whose test runs on several GPUs is detected at Setup; pass these only to override; optimize/author only; gpu_ids must hold enough GPUs).',
+  description: 'Single ENTRY POINT for kernel optimization on AMD GPUs: Instinct MI-series (CDNA gfx942/gfx950), the validated RDNA4 product Radeon AI PRO R9700 (gfx1201) and the RDNA3 Radeon Pro W7900 (gfx1100). The worker validates on-box identity via structured rocminfo data; generic gfx1201 is not a product identity, and gfx1100 without the exact W7900 product is refused. Dispatches on args.mode: optimize/author/mega -> delegate one lane to the kernel_lane worker (optimize/author unchanged; mega = multi-rank whole-kernel candidate search); bakeoff -> freeze the input kernel into ONE immutable oracle + frozen baseline, discover per-language existing impls + offline-tune env backends (aiter/CK), then run one worker lane per backend language (HIP/Triton/FlyDSL/CK/...) in parallel over the GPU pool and pick the fastest verified result across ALL candidates (author/optimize lanes AND the tuned env backend) — every one scored against the SAME frozen original baseline (anti-cheating). Wraps the unchanged kernel_lane worker (one workflow() nesting level; the dispatcher is the bake-off orchestrator).',
+  whenToUse: 'Optimize a kernel. Four modes, all via args.mode (there is NO natural-language mode detection — the caller picks): mode=optimize (DEFAULT) speeds up an EXISTING kernel and behaves exactly like the old single-language workflow; mode=author writes a fresh implementation from scratch, then optimizes it — use it when there is no source to edit yet, or to port the op to another language (pass args.target_language); mode=bakeoff tries several backend languages in parallel and keeps the fastest (pass args.backends, or leave empty to auto-discover). mode=mega optimizes a multi-rank operator (e.g. an EP MoE layer whose every run needs args.gpus_per_job GPUs) as independent whole-kernel candidates, each verified on-card against the frozen baseline. Bakeoff Freeze establishes structured product/ISA identity before Discover; optional expected_gfx/expected_target pins are validated against it. Anything else throws. Pass args.kernel_path (required), args.workflow_dir (required), args.mode, args.target_language, args.backends, args.budget, args.gpu_ids, args.gpu_mode (pool|pin, default pool), args.gpus_per_job / args.job_gpu_ids (optional: a task whose test runs on several GPUs is detected at Setup; pass these only to override; optimize/author only; gpu_ids must hold enough GPUs).',
   phases: [
     { title: 'Freeze',   detail: 'oracle_freezer: freeze the input kernel -> immutable oracle + baseline_src/ (the ONE denominator) [bakeoff only]' },
     { title: 'Discover', detail: 'op_benchmarker: per-language existing-impl probe + measure + OFFLINE env tune (aiter/CK, shapes from the frozen oracle) -> author_plan, best_known_ms [bakeoff only]' },
@@ -91,10 +91,11 @@ if (OPTIMIZER === 'evo' && MODE === 'bakeoff') {
 // SINGLE-LANGUAGE PASS-THROUGH (mode=optimize | author) — byte-compatible with
 // the pre-dispatcher behavior. Forward EVERY arg to the worker unchanged (the
 // worker ignores dispatcher-only args like `backends`). One nesting level.
+// mode=mega goes to the same worker (its multi-rank candidate search backend).
 // ===========================================================================
-if (MODE === 'optimize' || MODE === 'author') {
+if (MODE === 'optimize' || MODE === 'author' || MODE === 'mega') {
   phase('Bakeoff');            // reuse a declared phase slot for the single passthrough lane
-  log(`mode=${MODE}: single-language pass-through -> ${WORKER}`);
+  log(`mode=${MODE}: ${MODE === 'mega' ? '' : 'single-language '}pass-through -> ${WORKER}`);
   const r = await workflow({ scriptPath: WORKER }, { ...A, workflow_dir: WORKFLOW_DIR });
   // Final step: render the run report (token/time/cost ledger -> clickable role-execution-tree
   // HTML + MD twin) from the lane's OWN timeline. In passthrough the dispatcher makes no agent calls
@@ -135,7 +136,7 @@ if (MODE === 'optimize' || MODE === 'author') {
 // args.backends to pick the languages, or leave it empty to auto-discover.
 // ===========================================================================
 if (MODE !== 'bakeoff') {
-  throw new Error(`unknown mode='${MODE}'. Use optimize | author | bakeoff.`);
+  throw new Error(`unknown mode='${MODE}'. Use optimize | author | bakeoff | mega.`);
 }
 // Bake-off lanes each take a slice of gpu_ids, so multi-GPU jobs are only supported by the
 // single-language modes for now.
@@ -155,8 +156,8 @@ if (!!EXPECTED_GFX !== !!EXPECTED_TARGET) {
   throw new Error('expected_gfx and expected_target must be supplied together');
 }
 if ((EXPECTED_GFX && !/^gfx[0-9a-f]+$/.test(EXPECTED_GFX)) ||
-    (EXPECTED_TARGET && !['r9700', 'r9600d', 'unknown'].includes(EXPECTED_TARGET))) {
-  throw new Error('invalid bakeoff identity: expected_gfx must be a gfx token and expected_target r9700|r9600d|unknown');
+    (EXPECTED_TARGET && !['r9700', 'r9600d', 'w7900', 'unknown'].includes(EXPECTED_TARGET))) {
+  throw new Error('invalid bakeoff identity: expected_gfx must be a gfx token and expected_target r9700|r9600d|w7900|unknown');
 }
 if (['r9700', 'r9600d'].includes(EXPECTED_TARGET) && EXPECTED_GFX !== 'gfx1201') {
   throw new Error(`expected_target=${EXPECTED_TARGET} requires expected_gfx=gfx1201`);
@@ -177,10 +178,20 @@ const GPU_FAMILIES = [
   { name: 'R9700', isa: /^gfx1201$/, isolate: true, matrixCore: 'WMMA' },
   // RDNA 3.5 APUs (Strix Halo is gfx1151). Only a gfx1151 Radeon 8060S has been run.
   { name: 'RDNA 3.5', isa: /^gfx115\d$/, isolate: true, matrixCore: 'WMMA' },
+  // Discrete RDNA3. The workflows accept gfx1100 only as the exact Radeon Pro W7900 (target w7900).
+  { name: 'W7900', isa: /^gfx1100$/, isolate: true, matrixCore: 'WMMA' },
 ];
 const GPU_FAMILY_DEFAULT = { name: 'default', isa: null, isolate: false, matrixCore: 'MFMA' };
 const gpuFamily = (gfx) => GPU_FAMILIES.find((f) => f.isa.test(String(gfx || ''))) || GPU_FAMILY_DEFAULT;
 // ---- end GPU families ----
+if (EXPECTED_TARGET === 'w7900' && EXPECTED_GFX !== 'gfx1100') {
+  throw new Error('expected_target=w7900 requires expected_gfx=gfx1100');
+}
+if (EXPECTED_GFX === 'gfx1100' && EXPECTED_TARGET !== 'w7900') {
+  throw new Error(
+    `expected_gfx=gfx1100 requires expected_target=w7900 (got ${EXPECTED_TARGET}): ` +
+    'no other gfx1100 product is validated');
+}
 let GPU_FAMILY = gpuFamily(EXPECTED_GFX);
 let KERNEL_KNOWLEDGE_DIR = String(A.perf_knowledge_dir ||
   (WORKFLOW_DIR.replace(/\/[^/]*$/, '') + '/perf_knowledge')).replace(/\/+$/, '');
@@ -440,6 +451,17 @@ if (EXPECTED_GFX && DETECTED_GFX !== EXPECTED_GFX) {
 if (['r9700', 'r9600d'].includes(EXPECTED_TARGET) && DETECTED_TARGET !== EXPECTED_TARGET) {
   throw new Error(`GPU product mismatch: expected ${EXPECTED_TARGET}, detected ${DETECTED_TARGET}`);
 }
+if (EXPECTED_TARGET === 'w7900' && DETECTED_TARGET !== 'w7900') {
+  throw new Error(`GPU product mismatch: expected w7900, detected ${DETECTED_TARGET}`);
+}
+if (DETECTED_GFX === 'gfx1100' && DETECTED_TARGET !== 'w7900') {
+  throw new Error(
+    `Detected gfx1100 with device_target=${DETECTED_TARGET}: only the exact Radeon Pro W7900 is ` +
+    'validated on gfx1100; refusing RDNA3 guidance');
+}
+if (DETECTED_TARGET === 'w7900' && DETECTED_GFX !== 'gfx1100') {
+  throw new Error(`Freeze returned device_target=w7900 on ${DETECTED_GFX}: w7900 requires gfx1100`);
+}
 if (!Number.isFinite(DETECTED_PHYSICAL_CU_COUNT) || DETECTED_PHYSICAL_CU_COUNT <= 0) {
   throw new Error('Freeze failed: oracle_freezer did not return a positive physical_cu_count');
 }
@@ -483,7 +505,9 @@ const DISCOVER_INTRO = GPU_FAMILY.isolate
   ? (
   'STANDALONE kernel bake-off — there is NO live server (do not try to launch or capture from one).\n' +
   `${GPU_FAMILY.name} / ${LANE_GFX} ISOLATION: do NOT consult learned KB, expert skills, AITER CDNA win cards, or CK/AITER offline tune.\n` +
-  'Do NOT inject MFMA / FNUZ / Instinct guidance. Discover existing impls by measuring the frozen oracle only.\n' +
+  'Do NOT inject MFMA / FNUZ / Instinct guidance.' +
+  (LANE_GFX === 'gfx1100' ? ' On gfx1100, plan lanes on wave32 WMMA with FP16, BF16 or INT8 inputs (INT4 is not validated).' : '') +
+  ' Discover existing impls by measuring the frozen oracle only.\n' +
   '(1) Tier-A DISCOVER: bench candidate backends on the immutable oracle in OP_TASK_DIR (HIP/Triton/hipBLASLt).\n' +
   '(2) SKIP Tier-B AITER/CK env tune — those inputs are CDNA-calibrated.\n' +
   '(3) Fill `baseline_ms` = the FROZEN input kernel`s ms on the oracle.\n' +
@@ -602,6 +626,7 @@ const results = await Promise.all(lanes.map(l => sem.with(1, async ([gpu]) => {
       expected_gfx: LANE_GFX, expected_target: LANE_TARGET,
       expected_device_name: LANE_DEVICE_NAME,
       expected_physical_cu_count: LANE_PHYSICAL_CU_COUNT,
+      ...(A.gpu_perf_level ? { gpu_perf_level: String(A.gpu_perf_level) } : {}),
       mode: l.mode, target_language: l.lang,
       op_spec: oracle.op_spec || OP_SPEC, workload_spec_path: oracle.workload_path || WORKLOAD_SPEC_PATH || '',
       budget: BUDGET, gpu_ids: gpu, gpu_mode: GPU_MODE, task: TASK, apply_to_original: 'false',
